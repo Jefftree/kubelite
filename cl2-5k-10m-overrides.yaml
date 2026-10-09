@@ -1,0 +1,28 @@
+# Fast-iteration (~9.5m) ClusterLoader2 overrides for single-VM 5,000-node simulator (kubelite).
+# Preserves 100% of the 5,000-node control-plane workload (60,000 concurrent pods / ~95,000 total pods
+# across Deployments, StatefulSets, Jobs, DaemonSet, ConfigMaps, Secrets, 1,300 Services, EndpointSlices)
+# while cutting non-workload wait bottlenecks:
+#   1. Services module switched from Sequence (1-at-a-time = 6m39s) to default QPS (~9s total, -6m30s)
+#   2. CL2_LATENCY_POD_COUNT reduced from 500 (100s at Uniform5qps) to 50 (10s at Uniform5qps, -1m30s)
+#   3. CL2_DEFAULT_QPS raised from 300 to 500 (matching KCM/scheduler QPS=500, -39s object submission)
+CL2_ENABLE_IN_CLUSTER_NETWORK_LATENCY: false
+CL2_ENABLE_DNS_PERFORMANCE: false
+CL2_ENABLE_NETWORK_PROGRAMMING: false
+CL2_ENABLE_API_AVAILABILITY_MEASUREMENT: false
+CL2_ENABLE_SLO_MEASUREMENT: false
+CL2_ENABLE_VIOLATIONS_FOR_API_CALL_PROMETHEUS_SIMPLE: false
+CL2_ENABLE_CLUSTER_OOMS_TRACKER: false
+ENABLE_RESTART_COUNT_CHECK: false
+ENABLE_SYSTEM_POD_METRICS: false
+PROMETHEUS_SCRAPE_KUBE_PROXY: false
+CL2_DELETE_NAMESPACE_TIMEOUT: 15m
+CL2_RATE_LIMIT_POD_CREATION: false
+CL2_LOAD_TEST_THROUGHPUT: 50
+CL2_DEFAULT_QPS: 500
+CL2_LATENCY_POD_COUNT: 50
+PODS_PER_NODE: 12
+BIG_GROUP_SIZE: 100
+MEDIUM_GROUP_SIZE: 30
+SMALL_GROUP_SIZE: 15
+SMALL_STATEFUL_SETS_PER_NAMESPACE: 1
+MEDIUM_STATEFUL_SETS_PER_NAMESPACE: 1
