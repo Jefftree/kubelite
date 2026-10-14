@@ -2,19 +2,19 @@
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 networking:
-  # 10.64.0.0/10 provides 16,384 /24 node PodCIDRs (default 10.244.0.0/16 exhausts after 256 nodes)
+  # 10.64.0.0/10 provides 65,536 /26 node PodCIDRs (default 10.244.0.0/16 exhausts after 256 nodes)
   podSubnet: "10.64.0.0/10"
   serviceSubnet: "10.130.0.0/15"
 nodes:
 - role: control-plane
   extraMounts:
-  - hostPath: /var/lib/kubelite-5k/etcd-main
+  - hostPath: /var/lib/kubelite/etcd-main
     containerPath: /var/lib/etcd
-  - hostPath: /var/lib/kubelite-5k/etcd-events
+  - hostPath: /var/lib/kubelite/etcd-events
     containerPath: /var/lib/etcd-events
-  - hostPath: /var/lib/kubelite-5k/etcd-leases
+  - hostPath: /var/lib/kubelite/etcd-leases
     containerPath: /var/lib/etcd-leases
-  - hostPath: /dev/shm/kubelite-5k/tokens
+  - hostPath: /var/lib/kubelite/tokens
     containerPath: /etc/kubernetes/pki/tokens
   kubeadmConfigPatches:
   - |
@@ -41,6 +41,7 @@ nodes:
         profiling: "true"
         contention-profiling: "true"
         bind-address: "0.0.0.0"
+        authorization-always-allow-paths: "/healthz,/livez,/readyz,/metrics"
     scheduler:
       extraArgs:
         kube-api-qps: "500"

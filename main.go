@@ -15,19 +15,23 @@ limitations under the License.
 */
 
 // Command kubelite simulates Kubernetes worker nodes (kubelet and kube-proxy)
-// inside a single process to reproduce control-plane watch fanout, Go runtime
-// scheduler contention, and write-path load without provisioning worker VMs:
-//   - Two dedicated HTTP/2 TLS connections per node (impersonating
-//     system:node:<name> and system:kube-proxy).
-//   - 11 baseline watches per node plus refcounted per-pod ConfigMap/Secret
-//     watches (matching kubelet watchBasedManager), draining non-pod watch
-//     streams into io.Discard to avoid client-side informer cache duplication.
-//   - 50%-jittered Lease heartbeats, periodic 4.9 KB NodeStatus patches, and
-//     3-stage PodStatus transitions (Pending -> Started -> Ready) preceded by
-//     GET /pods/{name} (matching kubelet status_manager).
+// inside a single process to reproduce 5,000-node to 65,000-node control-plane
+// watch fanout, Go runtime scheduler contention, and write-path load without
+// provisioning worker VMs:
+//   - Two dedicated HTTP/2 TLS connections per full-watch node (authenticating
+//     via per-node static tokens as system:node:<name> or impersonating).
+//   - 11 baseline watches per full-watch node plus refcounted per-pod
+//     ConfigMap/Secret watches (matching kubelet watchBasedManager), draining
+//     non-pod watch streams into io.Discard.
+//   - Configurable --full-watch-nodes and --shared-pod-watch with sparse Lease
+//     heartbeats so 65,000 nodes stay Ready and actuate Pods on a single VM.
+//   - Per-init-container and per-container PodStatus PATCH stages preceded by
+//     GET /pods/{name}, per-pod ServiceAccount TokenRequest calls, and an HTTP
+//     chaos server (/disconnect, /reconnect, /status) for WatchList storms.
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -40,12 +44,14 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	authenticationv1 "k8s.io/api/authentication/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -71,11 +77,18 @@ import (
 )
 
 const (
-	kubeletUserAgent   = "kubelet/v1.36.1 (linux/amd64) kubernetes/kubelite"
-	kubeProxyUserAgent = "kube-proxy/v1.36.1 (linux/amd64) kubernetes/kubelite"
-	simulatedLabelKey  = "kubelite.k8s.io/simulated"
-	taintSimulatedKey  = "kubelite.io/simulated"
-	pauseImageID       = "registry.k8s.io/pause@sha256:7031c1b283388d2c2e09b57badb803c05ebed362dc88d84b480cc47f72a21097"
+	kubeletUserAgent        = "kubelet/v1.36.1 (linux/amd64) kubernetes/kubelite"
+	kubeProxyUserAgent      = "kube-proxy/v1.36.1 (linux/amd64) kubernetes/kubelite"
+	ciliumUserAgent         = "cilium-agent/v1.16.0 (linux/amd64) kubernetes/kubelite"
+	netdUserAgent           = "netd/v0.0.0 (linux/amd64) kubernetes/kubelite"
+	autoscalingUserAgent    = "autoscaling-metrics-pipeline/v0.0.0 (linux/amd64) kubernetes/kubelite"
+	prometheusUserAgent     = "Prometheus/"
+	simulatedLabelKey       = "kubelite.k8s.io/simulated"
+	taintSimulatedKey       = "kubelite.io/simulated"
+	pauseImageID            = "registry.k8s.io/pause@sha256:7031c1b283388d2c2e09b57badb803c05ebed362dc88d84b480cc47f72a21097"
+	defaultKubeconfigVarLib = "/var/lib/kubelite/kubeconfig"
+	sparseTransportCnt      = 256
+	watchListSteadyStateMin = 60 * time.Second
 )
 
 var defaultNodeImages = func() []corev1.ContainerImage {
@@ -91,10 +104,16 @@ var defaultNodeImages = func() []corev1.ContainerImage {
 }()
 
 type Config struct {
-	Kubeconfig, NodePrefix, PVCNamespacePrefix                                 string
-	NumNodes, RegisterConcurrency, PodWorkers, MaxInflightMut, PodStatusStages int
-	LeaseInterval, NodeStatusInterval, PodStartupDelay, Jitter                 time.Duration
-	TaintSimulated, CleanupOnExit                                              bool
+	Kubeconfig, APIServerURL, TokensFile, NodePrefix, PVCNamespacePrefix string
+	ControlAddr, WatchMode                                               string
+	NumNodes, RegisterConcurrency, PodWorkers, MaxInflightMut            int
+	PodStatusStages, FullWatchNodes, NodeAccelerators, PodCIDRBaseOctet  int
+	LeaseInterval, SparseLeaseInterval                                   time.Duration
+	NodeStatusInterval, SparseNodeStatusInterval                         time.Duration
+	PodStartupDelay, Jitter, ReconnectStagger                            time.Duration
+	TaintSimulated, CleanupOnExit                                        bool
+	SharedPodWatch, SkipPrePatchGet, EmitPodEvents, RequestPodTokens     bool
+	SimulateNodeAgents                                                   bool
 }
 
 type SimNode struct {
@@ -122,8 +141,13 @@ func (rt *impersonatingRoundTripper) RoundTrip(req *http.Request) (*http.Respons
 	if rt.bearer != "" {
 		req2.Header.Set("Authorization", "Bearer "+rt.bearer)
 	}
-	req2.Header.Set("Impersonate-User", rt.user)
-	req2.Header["Impersonate-Group"] = rt.groups
+	if rt.user != "" {
+		req2.Header.Set("Impersonate-User", rt.user)
+		req2.Header["Impersonate-Group"] = rt.groups
+	} else {
+		req2.Header.Del("Impersonate-User")
+		req2.Header.Del("Impersonate-Group")
+	}
 	if req2.Header.Get("User-Agent") == "" {
 		req2.Header.Set("User-Agent", rt.ua)
 	}
@@ -131,120 +155,228 @@ func (rt *impersonatingRoundTripper) RoundTrip(req *http.Request) (*http.Respons
 }
 
 type Simulator struct {
-	cfg          Config
-	baseURL      string
-	isLoopback   bool
-	adminClient  *kubernetes.Clientset
-	tlsConfig    *tls.Config
-	nodesByName  map[string]*SimNode
-	nodes        []*SimNode
-	podMutateSem chan struct{}
-	podWorkCh    chan *corev1.Pod
-	seenUIDs     sync.Map // types.UID -> int (1=started, 2=deleted)
+	cfg              Config
+	baseURL          string
+	isLoopback       bool
+	adminClient      *kubernetes.Clientset
+	tlsConfig        *tls.Config
+	nodeTLSConfig    *tls.Config
+	sparseTransports []*http.Transport
+	nodesByName      map[string]*SimNode
+	nodes            []*SimNode
+	podMutateSem     chan struct{}
+	eventSem         chan struct{}
+	podWorkCh        chan *corev1.Pod
+	seenUIDs         sync.Map // types.UID -> int (1=starting, 2=deleting, 3=ready)
+	latestRV         atomic.Value
+
+	sessionMu        sync.Mutex
+	sessionCancel    context.CancelFunc
+	disconnected     atomic.Bool
+	watchMode        atomic.Value // string: "watchlist", "rv0", "latest"
+	nodeAgents       atomic.Bool
+	reconnectStagger atomic.Int64
+	activeWatches    atomic.Int64
+	disconnectCount  atomic.Int64
+	reconnectCount   atomic.Int64
 }
 
-func main() {
-	var cfg Config
-	flag.StringVar(&cfg.Kubeconfig, "kubeconfig", os.Getenv("KUBECONFIG"), "Path to kubeconfig")
-	flag.IntVar(&cfg.NumNodes, "nodes", 5000, "Number of simulated nodes")
-	flag.StringVar(&cfg.NodePrefix, "node-prefix", "kubelite-", "Simulated node name prefix")
-	flag.StringVar(&cfg.PVCNamespacePrefix, "pvc-namespace-prefix", "test-", "Namespace prefix for auto-binding Pending PVCs")
-	flag.IntVar(&cfg.RegisterConcurrency, "register-concurrency", 128, "Concurrency for initial node registration")
-	flag.IntVar(&cfg.PodWorkers, "pod-workers", 512, "Concurrent workers actuating pod lifecycle transitions")
-	flag.IntVar(&cfg.MaxInflightMut, "max-inflight-pod-mutations", 96, "Max concurrent in-flight pod status/event/delete mutations")
-	flag.IntVar(&cfg.PodStatusStages, "pod-status-stages", 3, "Number of PodStatus PATCH stages per pod startup (1 or 3)")
-	flag.DurationVar(&cfg.LeaseInterval, "lease-interval", 10*time.Second, "Per-node Lease heartbeat interval")
-	flag.DurationVar(&cfg.NodeStatusInterval, "node-status-interval", 90*time.Second, "Per-node NodeStatus PATCH interval")
-	flag.DurationVar(&cfg.PodStartupDelay, "pod-startup-delay", 150*time.Millisecond, "Minimum delay before patching PodStatus")
-	flag.DurationVar(&cfg.Jitter, "pod-startup-jitter", 350*time.Millisecond, "Random startup jitter added to pod-startup-delay")
-	flag.BoolVar(&cfg.TaintSimulated, "taint-simulated", true, "Taint simulated nodes with kubelite.io/simulated=true:NoSchedule")
-	flag.BoolVar(&cfg.CleanupOnExit, "cleanup-on-exit", false, "Delete simulated nodes on SIGINT/SIGTERM")
-	klog.InitFlags(nil)
-	flag.Parse()
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
-	sim, err := NewSimulator(cfg)
-	if err != nil {
-		klog.Fatalf("Failed to initialize kubelite: %v", err)
+func fallbackKubeconfigPath() string {
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, ".kube", "kubelite-config")
 	}
-	if err := sim.Run(ctx); err != nil && ctx.Err() == nil {
-		klog.Fatalf("kubelite failed: %v", err)
-	}
+	return defaultKubeconfigVarLib
 }
 
-func NewSimulator(cfg Config) (*Simulator, error) {
-	restCfg, err := clientcmd.BuildConfigFromFlags("", cfg.Kubeconfig)
-	if err != nil {
-		return nil, fmt.Errorf("loading kubeconfig %q: %w", cfg.Kubeconfig, err)
+func defaultKubeconfigPath() string {
+	if env := os.Getenv("KUBECONFIG"); env != "" {
+		return env
 	}
-	restCfg.QPS, restCfg.Burst = 2000, 4000
-	restCfg.ContentType = k8sruntime.ContentTypeProtobuf
-	restCfg.AcceptContentTypes = k8sruntime.ContentTypeProtobuf + "," + k8sruntime.ContentTypeJSON
-
-	adminClient, err := kubernetes.NewForConfig(restCfg)
-	if err != nil {
-		return nil, err
+	if _, err := os.Stat(defaultKubeconfigVarLib); err == nil {
+		return defaultKubeconfigVarLib
 	}
-	u, err := url.Parse(restCfg.Host)
-	if err != nil {
-		return nil, err
-	}
-	tlsCfg, err := rest.TLSConfigFor(restCfg)
-	if err != nil {
-		return nil, err
-	}
-	tlsCfg.NextProtos = []string{"h2", "http/1.1"}
-	tlsCfg.ClientSessionCache = tls.NewLRUClientSessionCache(256)
-
-	sim := &Simulator{
-		cfg:          cfg,
-		baseURL:      strings.TrimRight(restCfg.Host, "/"),
-		isLoopback:   u.Hostname() == "127.0.0.1" || u.Hostname() == "localhost",
-		adminClient:  adminClient,
-		tlsConfig:    tlsCfg,
-		nodesByName:  make(map[string]*SimNode, cfg.NumNodes),
-		nodes:        make([]*SimNode, cfg.NumNodes),
-		podWorkCh:    make(chan *corev1.Pod, 131072),
-		podMutateSem: make(chan struct{}, max(1, cfg.MaxInflightMut)),
-	}
-	capList := corev1.ResourceList{
-		corev1.ResourceCPU:              resource.MustParse("4"),
-		corev1.ResourceMemory:           resource.MustParse("16Gi"),
-		corev1.ResourcePods:             resource.MustParse("110"),
-		corev1.ResourceEphemeralStorage: resource.MustParse("100Gi"),
-	}
-	nodeRestCfg := rest.CopyConfig(restCfg)
-	nodeRestCfg.RateLimiter = flowcontrol.NewFakeAlwaysRateLimiter()
-	zones := []string{"us-east1-b", "us-east1-c", "us-east1-d"}
-
-	for i := 0; i < cfg.NumNodes; i++ {
-		name := fmt.Sprintf("%s%04d", cfg.NodePrefix, i)
-		kubeletHTTP := sim.newNodeHTTPClient(i*2, "system:node:"+name, []string{"system:nodes", "system:authenticated"}, restCfg.BearerToken, kubeletUserAgent)
-		kubeProxyHTTP := sim.newNodeHTTPClient(i*2+1, "system:kube-proxy", []string{"system:authenticated"}, restCfg.BearerToken, kubeProxyUserAgent)
-		kubeletClient, err := kubernetes.NewForConfigAndClient(nodeRestCfg, kubeletHTTP)
-		if err != nil {
-			return nil, err
+	if fb := fallbackKubeconfigPath(); fb != defaultKubeconfigVarLib {
+		if _, err := os.Stat(fb); err == nil {
+			return fb
 		}
-		n := &SimNode{
-			Index: i, Name: name, InternalIP: fmt.Sprintf("10.128.%d.%d", (i/250)+1, (i%250)+2),
-			Zone: zones[i%len(zones)], KubeletClient: kubeletClient, KubeletHTTP: kubeletHTTP, KubeProxyHTTP: kubeProxyHTTP, Capacity: capList,
-			volRefCnt: make(map[string]int), volCancels: make(map[string]context.CancelFunc), podVols: make(map[types.UID][]string),
-		}
-		sim.nodes[i], sim.nodesByName[name] = n, n
 	}
-	return sim, nil
+	return defaultKubeconfigVarLib
 }
 
-func (s *Simulator) newNodeHTTPClient(connIdx int, user string, groups []string, bearer, ua string) *http.Client {
+func resolveKubeconfigPath(configured string) string {
+	if configured == "" {
+		configured = defaultKubeconfigPath()
+	}
+	if _, err := os.Stat(configured); err == nil {
+		return configured
+	}
+	if fb := fallbackKubeconfigPath(); fb != configured {
+		if _, err := os.Stat(fb); err == nil {
+			return fb
+		}
+	}
+	return configured
+}
+
+func formatNodeName(prefix string, index, totalNodes int) string {
+	if totalNodes >= 10000 {
+		return fmt.Sprintf("%s%05d", prefix, index)
+	}
+	return fmt.Sprintf("%s%04d", prefix, index)
+}
+
+func loadNodeTokens(path string) (map[string]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	tokens := make(map[string]string, 65536)
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, ",", 3)
+		if len(parts) >= 2 {
+			tokens[strings.TrimSpace(parts[1])] = strings.TrimSpace(parts[0])
+		}
+	}
+	return tokens, sc.Err()
+}
+
+func closeClientConnections(c *http.Client) {
+	if c == nil || c.Transport == nil {
+		return
+	}
+	if rt, ok := c.Transport.(*impersonatingRoundTripper); ok {
+		if tr, ok := rt.base.(*http.Transport); ok {
+			tr.CloseIdleConnections()
+		}
+	}
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+func isRetryableErr(err error) bool {
+	if apierrors.IsForbidden(err) || apierrors.IsConflict(err) ||
+		apierrors.IsInternalError(err) || apierrors.IsTimeout(err) ||
+		apierrors.IsServerTimeout(err) || apierrors.IsTooManyRequests(err) ||
+		apierrors.IsUnauthorized(err) || utilnet.IsProbableEOF(err) ||
+		utilnet.IsConnectionReset(err) {
+		return true
+	}
+	if _, shouldRetry := apierrors.SuggestsClientDelay(err); shouldRetry {
+		return true
+	}
+	if netErr, ok := err.(net.Error); ok {
+		return netErr.Temporary() || netErr.Timeout()
+	}
+	return strings.Contains(err.Error(), "http2: client connection lost")
+}
+
+func retryWithExponentialBackOff(fn func() error) error {
+	backoff := wait.Backoff{
+		Duration: 100 * time.Millisecond,
+		Factor:   3,
+		Jitter:   0,
+		Steps:    6,
+	}
+	return wait.ExponentialBackoff(backoff, func() (bool, error) {
+		err := fn()
+		if err == nil || apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		if isRetryableErr(err) {
+			return false, nil
+		}
+		return false, err
+	})
+}
+
+func (s *Simulator) withMutateSem(ctx context.Context, fn func() error) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case s.podMutateSem <- struct{}{}:
+		defer func() { <-s.podMutateSem }()
+		return fn()
+	}
+}
+
+func (s *Simulator) sleepAbortOnDelete(ctx context.Context, d time.Duration, uid types.UID) bool {
+	if d > 0 {
+		time.Sleep(d)
+	}
+	v, ok := s.seenUIDs.Load(uid)
+	return ctx.Err() == nil && (!ok || v.(int) != 2)
+}
+
+func (s *Simulator) isFullWatchNodeIndex(idx int) bool {
+	return s.cfg.FullWatchNodes <= 0 || idx < s.cfg.FullWatchNodes
+}
+
+func (s *Simulator) isFullWatchNode(n *SimNode) bool {
+	return s.isFullWatchNodeIndex(n.Index)
+}
+
+func (s *Simulator) currentWatchMode() string {
+	if v := s.watchMode.Load(); v != nil {
+		if m, ok := v.(string); ok && m != "" {
+			return m
+		}
+	}
+	return "watchlist"
+}
+
+func (s *Simulator) getLatestRV(ctx context.Context) string {
+	if v := s.latestRV.Load(); v != nil {
+		if rv, ok := v.(string); ok && rv != "" {
+			return rv
+		}
+	}
+	if s.adminClient != nil {
+		if ns, err := s.adminClient.CoreV1().Namespaces().Get(ctx, "default", metav1.GetOptions{ResourceVersion: "0"}); err == nil && ns != nil && ns.ResourceVersion != "" {
+			s.latestRV.Store(ns.ResourceVersion)
+			return ns.ResourceVersion
+		}
+	}
+	return "0"
+}
+
+func (s *Simulator) newTransport(connIdx int) *http.Transport {
 	dialer := &net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}
 	if s.isLoopback {
-		dialer.LocalAddr = &net.TCPAddr{IP: net.IPv4(127, 0, byte(1+(connIdx/200)), byte(1+(connIdx%200)))}
+		b1 := byte(1 + (connIdx/40000)%250)
+		b2 := byte(1 + (connIdx/200)%200)
+		b3 := byte(1 + (connIdx % 200))
+		dialer.LocalAddr = &net.TCPAddr{IP: net.IPv4(127, b1, b2, b3)}
 	}
-	tr := &http.Transport{
-		DialContext: dialer.DialContext, TLSClientConfig: s.tlsConfig.Clone(), ForceAttemptHTTP2: true,
+	return &http.Transport{
+		DialContext: dialer.DialContext, TLSClientConfig: s.nodeTLSConfig.Clone(), ForceAttemptHTTP2: true,
 		MaxIdleConnsPerHost: 2, IdleConnTimeout: 90 * time.Second, ReadBufferSize: 8192, WriteBufferSize: 8192,
+	}
+}
+
+func (s *Simulator) newNodeHTTPClient(connIdx int, dedicatedTransport bool, user string, groups []string, bearer, ua string) *http.Client {
+	var tr *http.Transport
+	if dedicatedTransport || len(s.sparseTransports) == 0 {
+		tr = s.newTransport(connIdx)
+	} else {
+		tr = s.sparseTransports[(connIdx/2)%len(s.sparseTransports)]
 	}
 	return &http.Client{Transport: &impersonatingRoundTripper{base: tr, bearer: bearer, user: user, groups: groups, ua: ua}}
 }
@@ -255,6 +387,7 @@ func (s *Simulator) ensureNodeWatchRBAC(ctx context.Context) {
 		Rules: []rbacv1.PolicyRule{
 			{APIGroups: []string{"storage.k8s.io"}, Resources: []string{"csinodes"}, Verbs: []string{"get", "list", "watch"}},
 			{APIGroups: []string{""}, Resources: []string{"configmaps", "secrets"}, Verbs: []string{"get", "list", "watch"}},
+			{APIGroups: []string{""}, Resources: []string{"serviceaccounts/token"}, Verbs: []string{"create"}},
 		},
 	}
 	if _, err := s.adminClient.RbacV1().ClusterRoles().Create(ctx, cr, metav1.CreateOptions{}); apierrors.IsAlreadyExists(err) {
@@ -270,65 +403,56 @@ func (s *Simulator) ensureNodeWatchRBAC(ctx context.Context) {
 	}
 }
 
-func (s *Simulator) Run(ctx context.Context) error {
-	start := time.Now()
-	s.ensureNodeWatchRBAC(ctx)
-	sem := make(chan struct{}, max(1, s.cfg.RegisterConcurrency))
-	var wg sync.WaitGroup
-	var firstErr atomic.Value
-	for _, n := range s.nodes {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(node *SimNode) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			if err := s.registerSingleNode(ctx, node); err != nil {
-				firstErr.CompareAndSwap(nil, err)
-			}
-		}(n)
+func (s *Simulator) nodePodCIDR(nodeIndex int) string {
+	base := s.cfg.PodCIDRBaseOctet
+	if base <= 0 {
+		base = 64
 	}
-	wg.Wait()
-	if v := firstErr.Load(); v != nil {
-		return v.(error)
-	}
-	klog.Infof("Registered %d simulated nodes in %v", s.cfg.NumNodes, time.Since(start).Round(time.Millisecond))
+	return fmt.Sprintf("10.%d.%d.%d/26", base+(nodeIndex/1024), (nodeIndex/4)%256, (nodeIndex%4)*64)
+}
 
-	for w := 0; w < s.cfg.PodWorkers; w++ {
-		go s.podActuatorWorker(ctx)
+func (s *Simulator) nodePodIP(nodeIndex int, uid types.UID) string {
+	base := s.cfg.PodCIDRBaseOctet
+	if base <= 0 {
+		base = 64
 	}
-	go s.watchAndBindPVCs(ctx)
-
-	for _, n := range s.nodes {
-		go s.runNodeLeaseController(ctx, n)
-		go s.runNodeStatusLoop(ctx, n)
-		s.startNodeWatches(ctx, n)
+	hostOffset := 2
+	if len(uid) > 0 {
+		hostOffset += int(uid[0]) % 60
 	}
-	<-ctx.Done()
-	if s.cfg.CleanupOnExit {
-		cctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-		defer cancel()
-		_ = s.adminClient.CoreV1().Nodes().DeleteCollection(cctx, metav1.DeleteOptions{}, metav1.ListOptions{LabelSelector: simulatedLabelKey + "=true"})
-	}
-	return nil
+	return fmt.Sprintf("10.%d.%d.%d", base+(nodeIndex/1024), (nodeIndex/4)%256, (nodeIndex%4)*64+hostOffset)
 }
 
 func (s *Simulator) buildNode(n *SimNode, hb metav1.Time) *corev1.Node {
-	cidr := fmt.Sprintf("10.%d.%d.0/24", 64+(n.Index/256), n.Index%256)
+	cidr := s.nodePodCIDR(n.Index)
 	var taints []corev1.Taint
 	if s.cfg.TaintSimulated {
 		taints = []corev1.Taint{{Key: taintSimulatedKey, Value: "true", Effect: corev1.TaintEffectNoSchedule}}
 	}
+	labels := map[string]string{
+		"kubernetes.io/hostname":           n.Name,
+		"kubernetes.io/os":                 "linux",
+		"kubernetes.io/arch":               "amd64",
+		"kubernetes.io/role":               "node",
+		"node-role.kubernetes.io/node":     "",
+		"topology.kubernetes.io/region":    "us-east1",
+		"topology.kubernetes.io/zone":      n.Zone,
+		"node.kubernetes.io/instance-type": "e2-medium",
+		simulatedLabelKey:                  "true",
+		taintSimulatedKey:                  "true",
+	}
+	if s.cfg.NodeAccelerators > 0 {
+		labels["worker-node-pool"] = "true"
+		labels["kubelite.k8s.io/nodepool"] = "default-pool"
+		labels["kubelite.k8s.io/accelerator"] = "tpu-v5p-slice"
+	}
 	return &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: n.Name, UID: n.UID,
-			Labels: map[string]string{
-				"kubernetes.io/hostname": n.Name, "kubernetes.io/os": "linux", "kubernetes.io/arch": "amd64",
-				"kubernetes.io/role": "node", "node-role.kubernetes.io/node": "", "topology.kubernetes.io/region": "us-east1",
-				"topology.kubernetes.io/zone": n.Zone, "node.kubernetes.io/instance-type": "e2-medium",
-				simulatedLabelKey: "true", taintSimulatedKey: "true",
-			},
+			Name:   n.Name,
+			UID:    n.UID,
+			Labels: labels,
 		},
-		Spec: corev1.NodeSpec{PodCIDR: cidr, PodCIDRs: []string{cidr}, ProviderID: fmt.Sprintf("gce://kubelite/%s/%s", n.Zone, n.Name), Taints: taints},
+		Spec: corev1.NodeSpec{PodCIDR: cidr, PodCIDRs: []string{cidr}, ProviderID: fmt.Sprintf("kubelite://%s/%s", n.Zone, n.Name), Taints: taints},
 		Status: corev1.NodeStatus{
 			Capacity: n.Capacity, Allocatable: n.Capacity, Phase: corev1.NodeRunning,
 			Addresses: []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: n.InternalIP}, {Type: corev1.NodeHostName, Address: n.Name}},
@@ -356,20 +480,75 @@ func (s *Simulator) patchNodeStatus(n *SimNode, hb metav1.Time) error {
 func (s *Simulator) registerSingleNode(ctx context.Context, n *SimNode) error {
 	now := metav1.Now()
 	n.TransitionTime = now
-	created, err := s.adminClient.CoreV1().Nodes().Create(ctx, s.buildNode(n, now), metav1.CreateOptions{})
-	if apierrors.IsAlreadyExists(err) {
-		created, err = s.adminClient.CoreV1().Nodes().Get(ctx, n.Name, metav1.GetOptions{})
-	}
+	var created *corev1.Node
+	err := retryWithExponentialBackOff(func() error {
+		var cErr error
+		created, cErr = s.adminClient.CoreV1().Nodes().Create(ctx, s.buildNode(n, now), metav1.CreateOptions{})
+		if apierrors.IsAlreadyExists(cErr) {
+			created, cErr = s.adminClient.CoreV1().Nodes().Get(ctx, n.Name, metav1.GetOptions{})
+		}
+		return cErr
+	})
 	if err != nil {
 		return fmt.Errorf("creating node %s: %w", n.Name, err)
 	}
 	n.UID = created.UID
-	return s.patchNodeStatus(n, now)
+	return retryWithExponentialBackOff(func() error {
+		return s.patchNodeStatus(n, now)
+	})
 }
 
-func (s *Simulator) runNodeLeaseController(ctx context.Context, n *SimNode) {
-	time.Sleep(time.Duration(int64(n.Index) * int64(s.cfg.LeaseInterval) / int64(max(1, s.cfg.NumNodes))))
-	lease.NewController(clock.RealClock{}, n.KubeletClient, n.Name, 40, nil, s.cfg.LeaseInterval, n.Name, corev1.NamespaceNodeLease,
+func (s *Simulator) markAllNodesReadyStatus(ctx context.Context, status corev1.ConditionStatus, reason, message string) {
+	sem := make(chan struct{}, max(1, s.cfg.RegisterConcurrency))
+	var wg sync.WaitGroup
+	now := metav1.Now()
+	for _, n := range s.nodes {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(node *SimNode) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			newNode := s.buildNode(node, now)
+			newNode.Status.Conditions[0] = corev1.NodeCondition{
+				Type:               corev1.NodeReady,
+				Status:             status,
+				LastHeartbeatTime:  now,
+				LastTransitionTime: now,
+				Reason:             reason,
+				Message:            message,
+			}
+			baseNode := newNode.DeepCopy()
+			baseNode.Status = corev1.NodeStatus{}
+			_, _, _ = nodeutil.PatchNodeStatus(s.adminClient.CoreV1(), types.NodeName(node.Name), baseNode, newNode)
+		}(n)
+	}
+	wg.Wait()
+}
+
+func (s *Simulator) runNodeLeaseController(ctx context.Context, n *SimNode, isReconnect bool, reconnectWindow time.Duration) {
+	interval := s.cfg.LeaseInterval
+	groupSize := s.cfg.NumNodes
+	idxInGroup := n.Index
+	if !s.isFullWatchNode(n) {
+		interval = s.cfg.SparseLeaseInterval
+		groupSize = max(1, s.cfg.NumNodes-s.cfg.FullWatchNodes)
+		idxInGroup = n.Index - s.cfg.FullWatchNodes
+	} else if s.cfg.FullWatchNodes > 0 && s.cfg.FullWatchNodes < s.cfg.NumNodes {
+		groupSize = s.cfg.FullWatchNodes
+	}
+	if interval <= 0 {
+		return
+	}
+	initialWindow := interval
+	if isReconnect {
+		initialWindow = reconnectWindow
+	}
+	delay := time.Duration(int64(idxInGroup) * int64(initialWindow) / int64(max(1, groupSize)))
+	if !sleepWithContext(ctx, delay) {
+		return
+	}
+	leaseDurationSec := max(int32(40), int32(interval.Seconds()*2))
+	lease.NewController(clock.RealClock{}, n.KubeletClient, n.Name, leaseDurationSec, nil, interval, n.Name, corev1.NamespaceNodeLease,
 		func(l *coordinationv1.Lease) error {
 			if len(l.OwnerReferences) == 0 {
 				l.OwnerReferences = []metav1.OwnerReference{{APIVersion: "v1", Kind: "Node", Name: n.Name, UID: n.UID}}
@@ -378,83 +557,41 @@ func (s *Simulator) runNodeLeaseController(ctx context.Context, n *SimNode) {
 		}).Run(ctx)
 }
 
-func (s *Simulator) runNodeStatusLoop(ctx context.Context, n *SimNode) {
-	if s.cfg.NodeStatusInterval <= 0 {
+func (s *Simulator) runNodeStatusLoop(ctx context.Context, n *SimNode, isReconnect bool, reconnectWindow time.Duration) {
+	interval := s.cfg.NodeStatusInterval
+	groupSize := s.cfg.NumNodes
+	idxInGroup := n.Index
+	if !s.isFullWatchNode(n) {
+		interval = s.cfg.SparseNodeStatusInterval
+		groupSize = max(1, s.cfg.NumNodes-s.cfg.FullWatchNodes)
+		idxInGroup = n.Index - s.cfg.FullWatchNodes
+	} else if s.cfg.FullWatchNodes > 0 && s.cfg.FullWatchNodes < s.cfg.NumNodes {
+		groupSize = s.cfg.FullWatchNodes
+	}
+	if interval <= 0 && !isReconnect {
 		return
 	}
-	time.Sleep(time.Duration(int64(n.Index) * int64(s.cfg.NodeStatusInterval) / int64(max(1, s.cfg.NumNodes))))
-	wait.UntilWithContext(ctx, func(_ context.Context) { _ = s.patchNodeStatus(n, metav1.Now()) }, s.cfg.NodeStatusInterval)
-}
-
-func (s *Simulator) startNodeWatches(ctx context.Context, n *SimNode) {
-	stagger := time.Duration(int64(n.Index) * int64(6*time.Second) / int64(max(1, s.cfg.NumNodes)))
-	go s.runNodePodWatch(ctx, n, stagger)
-
-	specs := []struct {
-		client   *http.Client
-		ua, path string
-	}{
-		{n.KubeletHTTP, kubeletUserAgent, "/api/v1/nodes?watch=true&fieldSelector=metadata.name%3D" + n.Name},
-		{n.KubeProxyHTTP, kubeProxyUserAgent, "/api/v1/services?watch=true&labelSelector=%21service.kubernetes.io%2Fservice-proxy-name"},
-		{n.KubeProxyHTTP, kubeProxyUserAgent, "/apis/discovery.k8s.io/v1/endpointslices?watch=true&labelSelector=%21service.kubernetes.io%2Fheadless"},
-		{n.KubeletHTTP, kubeletUserAgent, "/api/v1/services?watch=true"},
-		{n.KubeProxyHTTP, kubeProxyUserAgent, "/api/v1/nodes?watch=true&fieldSelector=metadata.name%3D" + n.Name},
-		{n.KubeletHTTP, kubeletUserAgent, "/apis/storage.k8s.io/v1/csidrivers?watch=true"},
-		{n.KubeletHTTP, kubeletUserAgent, "/apis/storage.k8s.io/v1/csinodes?watch=true&fieldSelector=metadata.name%3D" + n.Name},
-		{n.KubeletHTTP, kubeletUserAgent, "/apis/node.k8s.io/v1/runtimeclasses?watch=true"},
-		{n.KubeProxyHTTP, kubeProxyUserAgent, "/apis/networking.k8s.io/v1/servicecidrs?watch=true"},
-		{n.KubeletHTTP, kubeletUserAgent, "/api/v1/namespaces/kube-system/configmaps?watch=true&fieldSelector=metadata.name%3Dkube-root-ca.crt"},
+	initialWindow := interval
+	if isReconnect {
+		initialWindow = reconnectWindow
 	}
-	for i, sp := range specs {
-		go s.runWatchStream(ctx, sp.client, stagger+time.Duration(i+1)*40*time.Millisecond, sp.ua, s.baseURL+sp.path)
+	delay := time.Duration(int64(idxInGroup) * int64(initialWindow) / int64(max(1, groupSize)))
+	if !sleepWithContext(ctx, delay) {
+		return
 	}
-}
-
-func (s *Simulator) runWatchStream(ctx context.Context, client *http.Client, delay time.Duration, ua, watchURL string) {
-	if delay > 0 {
-		time.Sleep(delay)
-	}
-	rv := "0"
-	for ctx.Err() == nil {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s&allowWatchBookmarks=true&resourceVersion=%s&timeoutSeconds=%d", watchURL, rv, 7200+rand.IntN(3600)), nil)
-		if err != nil {
+	if isReconnect {
+		n.TransitionTime = metav1.Now()
+		_ = retryWithExponentialBackOff(func() error {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return s.patchNodeStatus(n, metav1.Now())
+		})
+		if interval <= 0 || !sleepWithContext(ctx, interval) {
 			return
 		}
-		req.Header.Set("Accept", k8sruntime.ContentTypeProtobuf)
-		req.Header.Set("User-Agent", ua)
-		resp, err := client.Do(req)
-		if err == nil && resp.StatusCode == http.StatusOK {
-			_, _ = io.Copy(io.Discard, resp.Body)
-			_ = resp.Body.Close()
-			if latest := s.fetchLatestRV(ctx, client, watchURL); latest != "" {
-				rv = latest
-			}
-		} else if resp != nil {
-			code := resp.StatusCode
-			_ = resp.Body.Close()
-			if code == http.StatusForbidden || code == http.StatusNotFound {
-				return
-			}
-		}
-		time.Sleep(time.Duration(500+rand.IntN(1500)) * time.Millisecond)
 	}
-}
-
-func (s *Simulator) fetchLatestRV(ctx context.Context, client *http.Client, watchURL string) string {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.Replace(watchURL, "watch=true", "limit=1&resourceVersion=0", 1), nil)
-	if err != nil {
-		return ""
-	}
-	resp, err := client.Do(req)
-	if err != nil || resp == nil {
-		return ""
-	}
-	defer resp.Body.Close()
-	var meta struct {
-		Metadata metav1.ListMeta `json:"metadata"`
-	}
-	_ = json.NewDecoder(resp.Body).Decode(&meta)
-	return meta.Metadata.ResourceVersion
+	wait.UntilWithContext(ctx, func(_ context.Context) { _ = s.patchNodeStatus(n, metav1.Now()) }, interval)
 }
 
 func extractPodVolumeWatchPaths(pod *corev1.Pod) []string {
@@ -489,7 +626,122 @@ func extractPodVolumeWatchPaths(pod *corev1.Pod) []string {
 	return paths
 }
 
+func (s *Simulator) buildWatchRequestURL(watchURL, rv string, synced bool) string {
+	timeoutSec := 7200 + rand.IntN(3600)
+	if !synced {
+		switch s.currentWatchMode() {
+		case "watchlist":
+			return fmt.Sprintf("%s&allowWatchBookmarks=true&sendInitialEvents=true&resourceVersionMatch=NotOlderThan&timeoutSeconds=%d", watchURL, timeoutSec)
+		case "rv0":
+			return fmt.Sprintf("%s&allowWatchBookmarks=true&resourceVersion=0&timeoutSeconds=%d", watchURL, timeoutSec)
+		}
+	}
+	if rv == "" {
+		rv = s.getLatestRV(context.Background())
+	}
+	return fmt.Sprintf("%s&allowWatchBookmarks=true&resourceVersion=%s&timeoutSeconds=%d", watchURL, rv, timeoutSec)
+}
+
+func (s *Simulator) runWatchStream(ctx context.Context, client *http.Client, delay time.Duration, ua, watchURL string) {
+	if !sleepWithContext(ctx, delay) {
+		return
+	}
+	var rv string
+	synced := false
+	for ctx.Err() == nil {
+		reqURL := s.buildWatchRequestURL(watchURL, rv, synced)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+		if err != nil {
+			return
+		}
+		req.Header.Set("Accept", k8sruntime.ContentTypeProtobuf)
+		req.Header.Set("User-Agent", ua)
+		streamStart := time.Now()
+		resp, err := client.Do(req)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			s.activeWatches.Add(1)
+			_, copyErr := io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			s.activeWatches.Add(-1)
+			if copyErr == nil || time.Since(streamStart) >= watchListSteadyStateMin {
+				synced = true
+				if latest := s.getLatestRV(ctx); latest != "" {
+					rv = latest
+				}
+			}
+		} else if resp != nil {
+			code := resp.StatusCode
+			_ = resp.Body.Close()
+			if code == http.StatusForbidden || code == http.StatusNotFound {
+				return
+			}
+			if synced {
+				if latest := s.getLatestRV(ctx); latest != "" {
+					rv = latest
+				}
+			}
+		}
+		if !sleepWithContext(ctx, time.Duration(500+rand.IntN(1500))*time.Millisecond) {
+			return
+		}
+	}
+}
+
+func (s *Simulator) runPrometheusNamespacePodWatch(ctx context.Context, n *SimNode, delay time.Duration, namespace string) {
+	if !sleepWithContext(ctx, delay) {
+		return
+	}
+	fieldSel := url.QueryEscape("spec.nodeName=" + n.Name + ",status.phase=Running")
+	listURL := fmt.Sprintf("%s/api/v1/namespaces/%s/pods?fieldSelector=%s&limit=500&resourceVersion=0", s.baseURL, namespace, fieldSel)
+	watchURL := fmt.Sprintf("%s/api/v1/namespaces/%s/pods?watch=true&fieldSelector=%s", s.baseURL, namespace, fieldSel)
+	for ctx.Err() == nil {
+		lreq, err := http.NewRequestWithContext(ctx, http.MethodGet, listURL, nil)
+		if err != nil {
+			return
+		}
+		lreq.Header.Set("Accept", k8sruntime.ContentTypeProtobuf)
+		lreq.Header.Set("User-Agent", prometheusUserAgent)
+		lresp, err := n.KubeletHTTP.Do(lreq)
+		if err != nil || lresp == nil {
+			if !sleepWithContext(ctx, time.Duration(500+rand.IntN(1500))*time.Millisecond) {
+				return
+			}
+			continue
+		}
+		_, _ = io.Copy(io.Discard, lresp.Body)
+		_ = lresp.Body.Close()
+		if lresp.StatusCode != http.StatusOK {
+			if !sleepWithContext(ctx, time.Duration(500+rand.IntN(1500))*time.Millisecond) {
+				return
+			}
+			continue
+		}
+		rv := s.getLatestRV(ctx)
+		wreq, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s&allowWatchBookmarks=true&resourceVersion=%s&timeoutSeconds=%d", watchURL, rv, 7200+rand.IntN(3600)), nil)
+		if err != nil {
+			return
+		}
+		wreq.Header.Set("Accept", k8sruntime.ContentTypeProtobuf)
+		wreq.Header.Set("User-Agent", prometheusUserAgent)
+		wresp, err := n.KubeletHTTP.Do(wreq)
+		if err == nil && wresp.StatusCode == http.StatusOK {
+			s.activeWatches.Add(1)
+			_, _ = io.Copy(io.Discard, wresp.Body)
+			_ = wresp.Body.Close()
+			s.activeWatches.Add(-1)
+		} else if wresp != nil {
+			_ = wresp.Body.Close()
+		}
+		if !sleepWithContext(ctx, time.Duration(500+rand.IntN(1500))*time.Millisecond) {
+			return
+		}
+	}
+}
+
 func (s *Simulator) syncPodVolumeWatches(ctx context.Context, n *SimNode, pod *corev1.Pod, active bool) {
+	if !s.isFullWatchNode(n) || s.disconnected.Load() {
+		return
+	}
 	n.volMu.Lock()
 	defer n.volMu.Unlock()
 	if active {
@@ -525,149 +777,73 @@ func (s *Simulator) syncPodVolumeWatches(ctx context.Context, n *SimNode, pod *c
 	}
 }
 
-func (s *Simulator) runNodePodWatch(ctx context.Context, n *SimNode, delay time.Duration) {
-	time.Sleep(delay)
-	fieldSel := "spec.nodeName=" + n.Name
-	lw := &cache.ListWatch{
-		WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
-			opts.FieldSelector, opts.AllowWatchBookmarks = fieldSel, true
-			return n.KubeletClient.CoreV1().Pods("").Watch(ctx, opts)
-		},
+func trimPodForSimulator(pod *corev1.Pod) {
+	if pod == nil {
+		return
 	}
-	for ctx.Err() == nil {
-		list, err := n.KubeletClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{FieldSelector: fieldSel, ResourceVersion: "0"})
-		if err != nil || list.ResourceVersion == "" {
-			time.Sleep(time.Second)
-			continue
-		}
-		for i := range list.Items {
-			s.enqueuePod(&list.Items[i])
-		}
-		if rw, err := retrywatcher.NewRetryWatcherWithContext(ctx, list.ResourceVersion, lw); err == nil {
-			for ev := range rw.ResultChan() {
-				if pod, ok := ev.Object.(*corev1.Pod); ok {
-					if ev.Type == watch.Deleted {
-						s.syncPodVolumeWatches(ctx, n, pod, false)
-						s.seenUIDs.Delete(pod.UID)
-					} else {
-						s.enqueuePod(pod)
-					}
-				}
-			}
-		}
-		time.Sleep(time.Second)
+	pod.ManagedFields = nil
+	pod.Annotations = nil
+	pod.OwnerReferences = nil
+	pod.Spec.Affinity = nil
+	pod.Spec.TopologySpreadConstraints = nil
+	pod.Spec.Tolerations = nil
+	pod.Spec.SecurityContext = nil
+	pod.Spec.ImagePullSecrets = nil
+	for i := range pod.Spec.InitContainers {
+		c := &pod.Spec.InitContainers[i]
+		c.Env = nil
+		c.Ports = nil
+		c.SecurityContext = nil
+		c.Command = nil
+		c.Args = nil
+	}
+	for i := range pod.Spec.Containers {
+		c := &pod.Spec.Containers[i]
+		c.Env = nil
+		c.Ports = nil
+		c.SecurityContext = nil
+		c.Command = nil
+		c.Args = nil
 	}
 }
 
-func isSimulatedPodReady(pod *corev1.Pod) bool {
+func isPodConditionReady(pod *corev1.Pod) bool {
 	if pod.Status.Phase != corev1.PodRunning {
 		return false
 	}
 	for _, c := range pod.Status.Conditions {
-		if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
-			return true
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue
 		}
 	}
 	return false
 }
 
-func (s *Simulator) enqueuePod(pod *corev1.Pod) {
-	if pod.Spec.NodeName == "" || s.nodesByName[pod.Spec.NodeName] == nil {
+func (s *Simulator) inspectPod(n *SimNode, pod *corev1.Pod) {
+	if n == nil || pod.Spec.NodeName == "" || s.disconnected.Load() {
 		return
 	}
 	if pod.DeletionTimestamp != nil {
 		if prev, _ := s.seenUIDs.Swap(pod.UID, 2); prev != 2 {
 			s.podWorkCh <- pod
 		}
-	} else if !isSimulatedPodReady(pod) {
+		return
+	}
+	if pod.Status.Phase == corev1.PodPending {
 		if _, loaded := s.seenUIDs.LoadOrStore(pod.UID, 1); !loaded {
 			s.podWorkCh <- pod
 		}
+		return
 	}
-}
-
-func (s *Simulator) podActuatorWorker(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case pod := <-s.podWorkCh:
-			n := s.nodesByName[pod.Spec.NodeName]
-			if n == nil {
-				continue
-			}
-			if pod.DeletionTimestamp != nil {
-				s.syncPodVolumeWatches(ctx, n, pod, false)
-				if s.cfg.PodStatusStages >= 3 {
-					_ = s.patchPodStatusStage(ctx, n, pod, corev1.PodRunning, false, true, "", false)
-				}
-				_ = s.patchPodStatusStage(ctx, n, pod, corev1.PodRunning, false, false, "", true)
-				_ = s.withMutateSem(ctx, func() error {
-					return retryWithExponentialBackOff(func() error {
-						return n.KubeletClient.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
-							GracePeriodSeconds: ptr.To(int64(0)), Preconditions: &metav1.Preconditions{UID: &pod.UID},
-						})
-					})
-				})
-				continue
-			}
-
-			s.syncPodVolumeWatches(ctx, n, pod, true)
-			totalDelay := s.cfg.PodStartupDelay + time.Duration(rand.Int64N(max(1, int64(s.cfg.Jitter))))
-			if s.cfg.PodStatusStages >= 3 {
-				step := max(50*time.Millisecond, totalDelay/3)
-				if !s.sleepAbortOnDelete(ctx, step, pod.UID) {
-					continue
-				}
-				_ = s.patchPodStatusStage(ctx, n, pod, corev1.PodPending, false, false, "ContainerCreating", false)
-				s.emitPodEvent(ctx, n, pod, "Pulled", "Container image already present on machine")
-
-				if !s.sleepAbortOnDelete(ctx, step, pod.UID) {
-					continue
-				}
-				_ = s.patchPodStatusStage(ctx, n, pod, corev1.PodRunning, false, true, "", false)
-				s.emitPodEvent(ctx, n, pod, "Created", "Created container "+pod.Name)
-
-				if !s.sleepAbortOnDelete(ctx, step, pod.UID) {
-					continue
-				}
-			} else if !s.sleepAbortOnDelete(ctx, totalDelay, pod.UID) {
-				continue
-			}
-			if err := s.patchPodStatusStage(ctx, n, pod, corev1.PodRunning, true, true, "", false); err != nil {
-				s.seenUIDs.Delete(pod.UID)
-				continue
-			}
-			s.emitPodEvent(ctx, n, pod, "Started", "Started container "+pod.Name)
+	// When KCM's NodeLifecycleController marks a disconnected node Ready=Unknown,
+	// controllerutil.MarkPodsNotReady patches running pods to PodReady=False while
+	// keeping Phase=Running. Re-queue those pods once the node reconnects.
+	if pod.Status.Phase == corev1.PodRunning && !isPodConditionReady(pod) {
+		if v, loaded := s.seenUIDs.Load(pod.UID); !loaded || v.(int) == 3 {
+			s.seenUIDs.Store(pod.UID, 1)
+			s.podWorkCh <- pod
 		}
 	}
-}
-
-func (s *Simulator) sleepAbortOnDelete(ctx context.Context, d time.Duration, uid types.UID) bool {
-	time.Sleep(d)
-	v, ok := s.seenUIDs.Load(uid)
-	return ctx.Err() == nil && (!ok || v.(int) != 2)
-}
-
-func (s *Simulator) emitPodEvent(ctx context.Context, n *SimNode, pod *corev1.Pod, reason, msg string) {
-	now := metav1.Now()
-	ev := &corev1.Event{
-		ObjectMeta:          metav1.ObjectMeta{Name: fmt.Sprintf("%s.%s.%x", pod.Name, strings.ToLower(reason), now.UnixNano()), Namespace: pod.Namespace},
-		InvolvedObject:      corev1.ObjectReference{Kind: "Pod", Namespace: pod.Namespace, Name: pod.Name, UID: pod.UID, APIVersion: "v1", ResourceVersion: pod.ResourceVersion},
-		Reason:              reason,
-		Message:             msg,
-		Source:              corev1.EventSource{Component: "kubelet", Host: n.Name},
-		FirstTimestamp:      now,
-		LastTimestamp:       now,
-		Count:               1,
-		Type:                corev1.EventTypeNormal,
-		ReportingController: "kubelet",
-		ReportingInstance:   n.Name,
-	}
-	_ = s.withMutateSem(ctx, func() error {
-		_, err := n.KubeletClient.CoreV1().Events(pod.Namespace).Create(ctx, ev, metav1.CreateOptions{})
-		return err
-	})
 }
 
 func buildVolumeMountStatuses(mounts []corev1.VolumeMount) []corev1.VolumeMountStatus {
@@ -691,15 +867,75 @@ func buildVolumeMountStatuses(mounts []corev1.VolumeMount) []corev1.VolumeMountS
 	return out
 }
 
-func (s *Simulator) patchPodStatusStage(ctx context.Context, n *SimNode, pod *corev1.Pod, phase corev1.PodPhase, ready, started bool, waitingReason string, terminated bool) error {
+func (s *Simulator) requestServiceAccountTokenAsNode(ctx context.Context, n *SimNode, pod *corev1.Pod) {
+	if !s.cfg.RequestPodTokens {
+		return
+	}
+	saName := pod.Spec.ServiceAccountName
+	if saName == "" {
+		saName = "default"
+	}
+	ns, name, uid := pod.Namespace, pod.Name, pod.UID
+	go func() {
+		select {
+		case <-ctx.Done():
+			return
+		case s.eventSem <- struct{}{}:
+			defer func() { <-s.eventSem }()
+			tr := &authenticationv1.TokenRequest{
+				Spec: authenticationv1.TokenRequestSpec{
+					ExpirationSeconds: ptr.To(int64(3607)),
+					BoundObjectRef:    &authenticationv1.BoundObjectReference{Kind: "Pod", APIVersion: "v1", Name: name, UID: uid},
+				},
+			}
+			_, _ = n.KubeletClient.CoreV1().ServiceAccounts(ns).CreateToken(ctx, saName, tr, metav1.CreateOptions{})
+		}
+	}()
+}
+
+func (s *Simulator) emitPodEvent(ctx context.Context, n *SimNode, pod *corev1.Pod, reason, msg string) {
+	if !s.cfg.EmitPodEvents {
+		return
+	}
+	now := metav1.Now()
+	ev := &corev1.Event{
+		ObjectMeta:          metav1.ObjectMeta{Name: fmt.Sprintf("%s.%s.%x.%x", pod.Name, strings.ToLower(reason), now.UnixNano(), rand.Uint32()), Namespace: pod.Namespace},
+		InvolvedObject:      corev1.ObjectReference{Kind: "Pod", Namespace: pod.Namespace, Name: pod.Name, UID: pod.UID, APIVersion: "v1", ResourceVersion: pod.ResourceVersion},
+		Reason:              reason,
+		Message:             msg,
+		Source:              corev1.EventSource{Component: "kubelet", Host: n.Name},
+		FirstTimestamp:      now,
+		LastTimestamp:       now,
+		Count:               1,
+		Type:                corev1.EventTypeNormal,
+		ReportingController: "kubelet",
+		ReportingInstance:   n.Name,
+	}
+	go func() {
+		select {
+		case <-ctx.Done():
+			return
+		case s.eventSem <- struct{}{}:
+			defer func() { <-s.eventSem }()
+			_, _ = n.KubeletClient.CoreV1().Events(ev.Namespace).Create(ctx, ev, metav1.CreateOptions{})
+		}
+	}()
+}
+
+func (s *Simulator) patchPodStatusStage(ctx context.Context, n *SimNode, pod *corev1.Pod, phase corev1.PodPhase, initRunningIdx, initDoneCount, readyCount int, started bool, waitingReason string, terminated, allowDeleting bool) error {
+	attempt := 0
+	skipFirstGet := s.cfg.SkipPrePatchGet || s.cfg.PodStatusStages == 1
 	return retryWithExponentialBackOff(func() error {
 		return s.withMutateSem(ctx, func() error {
-			if latest, err := n.KubeletClient.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{}); err == nil && latest != nil {
-				pod = latest
-			} else if apierrors.IsNotFound(err) {
-				return nil
+			attempt++
+			if !skipFirstGet || attempt > 1 {
+				if latest, err := n.KubeletClient.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{}); err == nil && latest != nil {
+					pod = latest
+				} else if apierrors.IsNotFound(err) {
+					return nil
+				}
 			}
-			if !terminated && pod.DeletionTimestamp != nil {
+			if !allowDeleting && pod.DeletionTimestamp != nil {
 				return nil
 			}
 			now := metav1.Now()
@@ -710,7 +946,7 @@ func (s *Simulator) patchPodStatusStage(ctx context.Context, n *SimNode, pod *co
 					break
 				}
 			}
-			podIP := fmt.Sprintf("10.%d.%d.%d", 64+(n.Index/256), n.Index%256, 2+(int(pod.UID[0])%250))
+			podIP := s.nodePodIP(n.Index, pod.UID)
 			uidHex := strings.ReplaceAll(string(pod.UID), "-", "")
 			containerUser := &corev1.ContainerUser{
 				Linux: &corev1.LinuxContainerUser{UID: 65532, GID: 65532, SupplementalGroups: []int64{65532}},
@@ -719,16 +955,25 @@ func (s *Simulator) patchPodStatusStage(ctx context.Context, n *SimNode, pod *co
 			var initStatuses []corev1.ContainerStatus
 			if len(pod.Spec.InitContainers) > 0 {
 				initStatuses = make([]corev1.ContainerStatus, len(pod.Spec.InitContainers))
-				initStarted := false
 				for i, ic := range pod.Spec.InitContainers {
 					cid := fmt.Sprintf("containerd://%s%032x", uidHex, i+100)
 					icRes := ic.Resources
+					isDone := i < initDoneCount
+					isRunning := i == initRunningIdx
+					st := corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "PodInitializing"}}
+					if isDone {
+						st = corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+							ExitCode: 0, Reason: "Completed", StartedAt: schedTime, FinishedAt: now, ContainerID: cid,
+						}}
+					} else if isRunning {
+						st = corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: now}}
+					}
 					initStatuses[i] = corev1.ContainerStatus{
 						Name: ic.Name, Image: ic.Image, ImageID: pauseImageID,
-						ContainerID: cid, Ready: true, Started: &initStarted,
-						State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
-							ExitCode: 0, Reason: "Completed", StartedAt: schedTime, FinishedAt: schedTime, ContainerID: cid,
-						}},
+						ContainerID:        cid,
+						Ready:              isDone,
+						Started:            &isRunning,
+						State:              st,
 						Resources:          &icRes,
 						AllocatedResources: ic.Resources.Requests,
 						User:               containerUser,
@@ -741,11 +986,13 @@ func (s *Simulator) patchPodStatusStage(ctx context.Context, n *SimNode, pod *co
 			for i, c := range pod.Spec.Containers {
 				cid := fmt.Sprintf("containerd://%s%032x", uidHex, i)
 				cRes := c.Resources
+				cReady := i < readyCount && !terminated && waitingReason == ""
+				cStarted := started && !terminated && waitingReason == ""
 				cs := corev1.ContainerStatus{
 					Name: c.Name, Image: c.Image, ImageID: pauseImageID,
 					ContainerID:        cid,
-					Ready:              ready,
-					Started:            &started,
+					Ready:              cReady,
+					Started:            &cStarted,
 					State:              corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: now}},
 					Resources:          &cRes,
 					AllocatedResources: c.Resources.Requests,
@@ -763,11 +1010,16 @@ func (s *Simulator) patchPodStatusStage(ctx context.Context, n *SimNode, pod *co
 				cStatuses[i] = cs
 			}
 
+			allReady := readyCount >= len(pod.Spec.Containers) && len(pod.Spec.Containers) > 0 && !terminated && waitingReason == ""
 			readyCond, readyReason := corev1.ConditionFalse, "ContainersNotReady"
-			if ready {
+			if allReady {
 				readyCond, readyReason = corev1.ConditionTrue, ""
 			} else if phase == corev1.PodSucceeded {
 				readyReason = "PodCompleted"
+			}
+			initCond, initReason := corev1.ConditionTrue, ""
+			if initDoneCount < len(pod.Spec.InitContainers) {
+				initCond, initReason = corev1.ConditionFalse, "ContainersNotInitialized"
 			}
 			readyToStart := corev1.ConditionTrue
 			if terminated {
@@ -784,7 +1036,7 @@ func (s *Simulator) patchPodStatusStage(ctx context.Context, n *SimNode, pod *co
 				ObservedGeneration: gen,
 				Conditions: []corev1.PodCondition{
 					{Type: corev1.PodReadyToStartContainers, Status: readyToStart, LastTransitionTime: now, ObservedGeneration: gen},
-					{Type: corev1.PodInitialized, Status: corev1.ConditionTrue, LastTransitionTime: schedTime, ObservedGeneration: gen},
+					{Type: corev1.PodInitialized, Status: initCond, Reason: initReason, LastTransitionTime: schedTime, ObservedGeneration: gen},
 					{Type: corev1.PodReady, Status: readyCond, Reason: readyReason, LastTransitionTime: now, ObservedGeneration: gen},
 					{Type: corev1.ContainersReady, Status: readyCond, Reason: readyReason, LastTransitionTime: now, ObservedGeneration: gen},
 					{Type: corev1.PodScheduled, Status: corev1.ConditionTrue, LastTransitionTime: schedTime, ObservedGeneration: gen},
@@ -799,76 +1051,509 @@ func (s *Simulator) patchPodStatusStage(ctx context.Context, n *SimNode, pod *co
 	})
 }
 
-func retryWithExponentialBackOff(fn func() error) error {
-	backoff := wait.Backoff{
-		Duration: 100 * time.Millisecond,
-		Factor:   3,
-		Jitter:   0,
-		Steps:    6,
-	}
-	return wait.ExponentialBackoff(backoff, func() (bool, error) {
-		err := fn()
-		if err == nil || apierrors.IsNotFound(err) {
-			return true, nil
+func (s *Simulator) podActuatorWorker(ctx context.Context) {
+	for {
+	nextPod:
+		select {
+		case <-ctx.Done():
+			return
+		case pod := <-s.podWorkCh:
+			if s.disconnected.Load() {
+				s.seenUIDs.Delete(pod.UID)
+				continue
+			}
+			n := s.nodesByName[pod.Spec.NodeName]
+			if n == nil {
+				continue
+			}
+			nInit := len(pod.Spec.InitContainers)
+			nCont := len(pod.Spec.Containers)
+			if pod.DeletionTimestamp != nil {
+				s.syncPodVolumeWatches(ctx, n, pod, false)
+				if s.cfg.PodStatusStages >= 3 {
+					_ = s.patchPodStatusStage(ctx, n, pod, corev1.PodRunning, -1, nInit, 0, true, "", false, true)
+					if nCont > 1 && len(pod.UID) > 0 && pod.UID[0]%2 == 0 {
+						s.emitPodEvent(ctx, n, pod, "Killing", "Stopping container "+pod.Spec.Containers[0].Name)
+					}
+					_ = s.patchPodStatusStage(ctx, n, pod, corev1.PodRunning, -1, nInit, 0, false, "", true, true)
+				}
+				if err := s.withMutateSem(ctx, func() error {
+					if !s.cfg.SkipPrePatchGet && s.cfg.PodStatusStages >= 3 {
+						_, _ = n.KubeletClient.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+					}
+					return retryWithExponentialBackOff(func() error {
+						return n.KubeletClient.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
+							GracePeriodSeconds: ptr.To(int64(0)), Preconditions: &metav1.Preconditions{UID: &pod.UID},
+						})
+					})
+				}); err != nil {
+					go func(p *corev1.Pod) {
+						time.Sleep(time.Second)
+						select {
+						case s.podWorkCh <- p:
+						default:
+							s.seenUIDs.Delete(p.UID)
+						}
+					}(pod)
+				}
+				continue
+			}
+
+			s.syncPodVolumeWatches(ctx, n, pod, true)
+			// Fast-path recovery for already-Running pods whose PodReady condition
+			// was flipped to False by KCM during a node disconnect.
+			if pod.Status.Phase == corev1.PodRunning {
+				if err := s.patchPodStatusStage(ctx, n, pod, corev1.PodRunning, -1, nInit, nCont, true, "", false, false); err != nil {
+					s.seenUIDs.Delete(pod.UID)
+					continue
+				}
+				s.seenUIDs.Store(pod.UID, 3)
+				continue
+			}
+
+			s.requestServiceAccountTokenAsNode(ctx, n, pod)
+			if !s.cfg.SkipPrePatchGet && s.cfg.PodStatusStages >= 3 {
+				_ = s.withMutateSem(ctx, func() error {
+					_, err := n.KubeletClient.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+					return err
+				})
+			}
+
+			totalDelay := s.cfg.PodStartupDelay + time.Duration(rand.Int64N(max(1, int64(s.cfg.Jitter))))
+			if s.cfg.PodStatusStages >= 3 {
+				numSleeps := 3 + 2*nInit
+				step := max(20*time.Millisecond, totalDelay/time.Duration(numSleeps))
+				for idx, ic := range pod.Spec.InitContainers {
+					if !s.sleepAbortOnDelete(ctx, step, pod.UID) {
+						goto nextPod
+					}
+					_ = s.patchPodStatusStage(ctx, n, pod, corev1.PodPending, idx, idx, 0, false, "PodInitializing", false, false)
+					s.emitPodEvent(ctx, n, pod, "Pulled", "Container image already present on machine ("+ic.Name+")")
+					s.emitPodEvent(ctx, n, pod, "Created", "Created container "+ic.Name)
+					s.emitPodEvent(ctx, n, pod, "Started", "Started container "+ic.Name)
+					if !s.sleepAbortOnDelete(ctx, step, pod.UID) {
+						goto nextPod
+					}
+					_ = s.patchPodStatusStage(ctx, n, pod, corev1.PodPending, -1, idx+1, 0, false, "PodInitializing", false, false)
+				}
+
+				if !s.sleepAbortOnDelete(ctx, step, pod.UID) {
+					continue
+				}
+				_ = s.patchPodStatusStage(ctx, n, pod, corev1.PodPending, -1, nInit, 0, false, "ContainerCreating", false, false)
+				s.emitPodEvent(ctx, n, pod, "Pulled", "Container image already present on machine")
+				if nCont > 1 {
+					s.emitPodEvent(ctx, n, pod, "Created", "Created container "+pod.Spec.Containers[0].Name)
+				}
+
+				if !s.sleepAbortOnDelete(ctx, step, pod.UID) {
+					continue
+				}
+				_ = s.patchPodStatusStage(ctx, n, pod, corev1.PodRunning, -1, nInit, 0, true, "", false, false)
+				if nCont > 1 {
+					s.emitPodEvent(ctx, n, pod, "Started", "Started container "+pod.Spec.Containers[0].Name)
+					for ci := 1; ci < min(3, nCont); ci++ {
+						s.emitPodEvent(ctx, n, pod, "Created", "Created container "+pod.Spec.Containers[ci].Name)
+						s.emitPodEvent(ctx, n, pod, "Started", "Started container "+pod.Spec.Containers[ci].Name)
+					}
+					if len(pod.UID) > 0 && pod.UID[0]%2 == 0 {
+						_ = s.patchPodStatusStage(ctx, n, pod, corev1.PodRunning, -1, nInit, nCont/2, true, "", false, false)
+					}
+				} else {
+					s.emitPodEvent(ctx, n, pod, "Created", "Created container "+pod.Name)
+				}
+
+				if !s.sleepAbortOnDelete(ctx, step, pod.UID) {
+					continue
+				}
+			} else if !s.sleepAbortOnDelete(ctx, totalDelay, pod.UID) {
+				continue
+			}
+			if err := s.patchPodStatusStage(ctx, n, pod, corev1.PodRunning, -1, nInit, nCont, true, "", false, false); err != nil {
+				go func(p *corev1.Pod) {
+					time.Sleep(500 * time.Millisecond)
+					s.seenUIDs.Delete(p.UID)
+					s.inspectPod(n, p)
+				}(pod)
+				continue
+			}
+			s.seenUIDs.Store(pod.UID, 3)
+			if nCont <= 1 {
+				s.emitPodEvent(ctx, n, pod, "Started", "Started container "+pod.Name)
+			}
 		}
-		if isRetryableErr(err) {
-			return false, nil
+	}
+}
+
+func (s *Simulator) runNodePodWatch(ctx context.Context, n *SimNode, delay time.Duration) {
+	if s.cfg.SharedPodWatch {
+		s.runWatchStream(ctx, n.KubeletHTTP, delay, kubeletUserAgent, s.baseURL+"/api/v1/pods?watch=true&fieldSelector=spec.nodeName%3D"+n.Name)
+		return
+	}
+	if !sleepWithContext(ctx, delay) {
+		return
+	}
+	fieldSel := "spec.nodeName=" + n.Name
+	for ctx.Err() == nil {
+		if s.currentWatchMode() == "watchlist" {
+			sendInit := true
+			w, err := n.KubeletClient.CoreV1().Pods("").Watch(ctx, metav1.ListOptions{
+				FieldSelector:        fieldSel,
+				AllowWatchBookmarks:  true,
+				SendInitialEvents:    &sendInit,
+				ResourceVersionMatch: metav1.ResourceVersionMatchNotOlderThan,
+			})
+			if err == nil {
+				s.activeWatches.Add(1)
+				for ev := range w.ResultChan() {
+					if pod, ok := ev.Object.(*corev1.Pod); ok {
+						if pod.ResourceVersion != "" {
+							s.latestRV.Store(pod.ResourceVersion)
+						}
+						trimPodForSimulator(pod)
+						if ev.Type == watch.Deleted {
+							s.syncPodVolumeWatches(ctx, n, pod, false)
+							s.seenUIDs.Delete(pod.UID)
+						} else {
+							s.inspectPod(n, pod)
+						}
+					}
+				}
+				w.Stop()
+				s.activeWatches.Add(-1)
+			}
+			if !sleepWithContext(ctx, time.Duration(500+rand.IntN(1500))*time.Millisecond) {
+				return
+			}
+			continue
 		}
-		return false, err
-	})
+
+		lw := &cache.ListWatch{
+			WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+				opts.FieldSelector, opts.AllowWatchBookmarks = fieldSel, true
+				return n.KubeletClient.CoreV1().Pods("").Watch(ctx, opts)
+			},
+		}
+		list, err := n.KubeletClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{FieldSelector: fieldSel, ResourceVersion: "0"})
+		if err != nil || list.ResourceVersion == "" {
+			if !sleepWithContext(ctx, time.Second) {
+				return
+			}
+			continue
+		}
+		rv := list.ResourceVersion
+		s.latestRV.Store(rv)
+		for i := range list.Items {
+			trimPodForSimulator(&list.Items[i])
+			pCopy := list.Items[i].DeepCopy()
+			s.inspectPod(n, pCopy)
+		}
+		list.Items = nil
+		if rw, err := retrywatcher.NewRetryWatcherWithContext(ctx, rv, lw); err == nil {
+			s.activeWatches.Add(1)
+			for ev := range rw.ResultChan() {
+				if pod, ok := ev.Object.(*corev1.Pod); ok {
+					if pod.ResourceVersion != "" {
+						s.latestRV.Store(pod.ResourceVersion)
+					}
+					trimPodForSimulator(pod)
+					if ev.Type == watch.Deleted {
+						s.syncPodVolumeWatches(ctx, n, pod, false)
+						s.seenUIDs.Delete(pod.UID)
+					} else {
+						s.inspectPod(n, pod)
+					}
+				}
+			}
+			s.activeWatches.Add(-1)
+		}
+		if !sleepWithContext(ctx, time.Second) {
+			return
+		}
+	}
 }
 
-func isRetryableErr(err error) bool {
-	if apierrors.IsForbidden(err) || apierrors.IsConflict(err) ||
-		apierrors.IsInternalError(err) || apierrors.IsTimeout(err) ||
-		apierrors.IsServerTimeout(err) || apierrors.IsTooManyRequests(err) ||
-		apierrors.IsUnauthorized(err) || utilnet.IsProbableEOF(err) ||
-		utilnet.IsConnectionReset(err) {
-		return true
-	}
-	if _, shouldRetry := apierrors.SuggestsClientDelay(err); shouldRetry {
-		return true
-	}
-	if netErr, ok := err.(net.Error); ok {
-		return netErr.Temporary() || netErr.Timeout()
-	}
-	return strings.Contains(err.Error(), "http2: client connection lost")
-}
-
-func (s *Simulator) withMutateSem(ctx context.Context, fn func() error) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case s.podMutateSem <- struct{}{}:
-		defer func() { <-s.podMutateSem }()
-		return fn()
-	}
-}
-
-func (s *Simulator) watchAndBindPVCs(ctx context.Context) {
+func (s *Simulator) runSharedPodWatch(ctx context.Context) {
 	lw := &cache.ListWatch{
 		WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
-			return s.adminClient.CoreV1().PersistentVolumeClaims("").Watch(ctx, opts)
+			opts.AllowWatchBookmarks = true
+			return s.adminClient.CoreV1().Pods("").Watch(ctx, opts)
 		},
 	}
 	for ctx.Err() == nil {
-		list, err := s.adminClient.CoreV1().PersistentVolumeClaims("").List(ctx, metav1.ListOptions{ResourceVersion: "0"})
+		list, err := s.adminClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{ResourceVersion: "0"})
 		if err != nil || list.ResourceVersion == "" {
 			time.Sleep(time.Second)
 			continue
 		}
+		rv := list.ResourceVersion
+		s.latestRV.Store(rv)
 		for i := range list.Items {
-			s.maybeBindPVC(ctx, &list.Items[i])
+			pod := &list.Items[i]
+			if pod.Spec.NodeName != "" {
+				if n := s.nodesByName[pod.Spec.NodeName]; n != nil {
+					trimPodForSimulator(pod)
+					pCopy := pod.DeepCopy()
+					s.inspectPod(n, pCopy)
+				}
+			}
+			list.Items[i] = corev1.Pod{}
 		}
-		if rw, err := retrywatcher.NewRetryWatcherWithContext(ctx, list.ResourceVersion, lw); err == nil {
+		list.Items = nil
+		list = nil
+		if rw, err := retrywatcher.NewRetryWatcherWithContext(ctx, rv, lw); err == nil {
 			for ev := range rw.ResultChan() {
-				if pvc, ok := ev.Object.(*corev1.PersistentVolumeClaim); ok {
-					s.maybeBindPVC(ctx, pvc)
+				if pod, ok := ev.Object.(*corev1.Pod); ok {
+					if pod.ResourceVersion != "" {
+						s.latestRV.Store(pod.ResourceVersion)
+					}
+					if pod.Spec.NodeName != "" {
+						trimPodForSimulator(pod)
+						if n := s.nodesByName[pod.Spec.NodeName]; n != nil {
+							if ev.Type == watch.Deleted {
+								s.syncPodVolumeWatches(ctx, n, pod, false)
+								s.seenUIDs.Delete(pod.UID)
+							} else {
+								s.inspectPod(n, pod)
+							}
+						}
+					}
 				}
 			}
 		}
 		time.Sleep(time.Second)
 	}
+}
+
+func (s *Simulator) reconcilePodsOnReconnect(ctx context.Context) {
+	list, err := s.adminClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{ResourceVersion: "0"})
+	if err != nil || list == nil {
+		return
+	}
+	for i := range list.Items {
+		pod := &list.Items[i]
+		if pod.Spec.NodeName != "" {
+			if n := s.nodesByName[pod.Spec.NodeName]; n != nil {
+				trimPodForSimulator(pod)
+				pCopy := pod.DeepCopy()
+				s.inspectPod(n, pCopy)
+			}
+		}
+		list.Items[i] = corev1.Pod{}
+	}
+}
+
+func (s *Simulator) startNodeWatches(ctx context.Context, n *SimNode, isReconnect bool, reconnectWindow time.Duration) {
+	watchNodes := s.cfg.NumNodes
+	if s.cfg.FullWatchNodes > 0 && s.cfg.FullWatchNodes < watchNodes {
+		watchNodes = s.cfg.FullWatchNodes
+	}
+	window := 6 * time.Second
+	if isReconnect {
+		window = reconnectWindow
+	}
+	stagger := time.Duration(int64(n.Index) * int64(window) / int64(max(1, watchNodes)))
+	if !s.cfg.SharedPodWatch || s.cfg.FullWatchNodes > 0 {
+		go s.runNodePodWatch(ctx, n, stagger)
+	}
+
+	type watchSpec struct {
+		client   *http.Client
+		ua, path string
+	}
+	specs := []watchSpec{
+		{n.KubeletHTTP, kubeletUserAgent, "/api/v1/nodes?watch=true&fieldSelector=metadata.name%3D" + n.Name},
+		{n.KubeProxyHTTP, kubeProxyUserAgent, "/api/v1/services?watch=true&labelSelector=%21service.kubernetes.io%2Fservice-proxy-name"},
+		{n.KubeProxyHTTP, kubeProxyUserAgent, "/apis/discovery.k8s.io/v1/endpointslices?watch=true&labelSelector=%21service.kubernetes.io%2Fheadless"},
+		{n.KubeletHTTP, kubeletUserAgent, "/api/v1/services?watch=true"},
+		{n.KubeProxyHTTP, kubeProxyUserAgent, "/api/v1/nodes?watch=true&fieldSelector=metadata.name%3D" + n.Name},
+		{n.KubeletHTTP, kubeletUserAgent, "/apis/storage.k8s.io/v1/csidrivers?watch=true"},
+		{n.KubeletHTTP, kubeletUserAgent, "/apis/storage.k8s.io/v1/csinodes?watch=true&fieldSelector=metadata.name%3D" + n.Name},
+		{n.KubeletHTTP, kubeletUserAgent, "/apis/node.k8s.io/v1/runtimeclasses?watch=true"},
+		{n.KubeProxyHTTP, kubeProxyUserAgent, "/apis/networking.k8s.io/v1/servicecidrs?watch=true"},
+		{n.KubeletHTTP, kubeletUserAgent, "/api/v1/namespaces/kube-system/configmaps?watch=true&fieldSelector=metadata.name%3Dkube-root-ca.crt"},
+	}
+	if s.nodeAgents.Load() {
+		specs = append(specs,
+			watchSpec{n.KubeletHTTP, ciliumUserAgent, "/api/v1/pods?watch=true&fieldSelector=spec.nodeName%3D" + n.Name},
+			watchSpec{n.KubeProxyHTTP, netdUserAgent, "/api/v1/pods?watch=true&fieldSelector=spec.nodeName%3D" + n.Name},
+			watchSpec{n.KubeletHTTP, autoscalingUserAgent, "/api/v1/pods?watch=true&fieldSelector=spec.nodeName%3D" + n.Name},
+		)
+		for j, ns := range []string{"kube-system", "monitoring", "metrics-system"} {
+			go s.runPrometheusNamespacePodWatch(ctx, n, stagger+time.Duration(len(specs)+j+1)*20*time.Millisecond, ns)
+		}
+	}
+	stepGap := 40 * time.Millisecond
+	if isReconnect {
+		stepGap = 5 * time.Millisecond
+	}
+	for i, sp := range specs {
+		go s.runWatchStream(ctx, sp.client, stagger+time.Duration(i+1)*stepGap, sp.ua, s.baseURL+sp.path)
+	}
+}
+
+func (s *Simulator) startNodeSession(parentCtx context.Context, isReconnect bool) {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	if s.sessionCancel != nil {
+		s.sessionCancel()
+	}
+	sctx, cancel := context.WithCancel(parentCtx)
+	s.sessionCancel = cancel
+	s.disconnected.Store(false)
+
+	reconnectWindow := time.Duration(s.reconnectStagger.Load())
+	for _, n := range s.nodes {
+		go s.runNodeLeaseController(sctx, n, isReconnect, reconnectWindow)
+		go s.runNodeStatusLoop(sctx, n, isReconnect, reconnectWindow)
+		if s.isFullWatchNode(n) {
+			s.startNodeWatches(sctx, n, isReconnect, reconnectWindow)
+		}
+	}
+	if isReconnect && s.cfg.SharedPodWatch {
+		go s.reconcilePodsOnReconnect(sctx)
+	}
+}
+
+func (s *Simulator) stopNodeSession() {
+	s.sessionMu.Lock()
+	cancel := s.sessionCancel
+	s.sessionCancel = nil
+	s.disconnected.Store(true)
+	s.sessionMu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	for _, n := range s.nodes {
+		n.volMu.Lock()
+		for _, c := range n.volCancels {
+			if c != nil {
+				c()
+			}
+		}
+		clear(n.volRefCnt)
+		clear(n.volCancels)
+		clear(n.podVols)
+		n.volMu.Unlock()
+		closeClientConnections(n.KubeletHTTP)
+		if n.KubeProxyHTTP != n.KubeletHTTP {
+			closeClientConnections(n.KubeProxyHTTP)
+		}
+	}
+	for _, tr := range s.sparseTransports {
+		tr.CloseIdleConnections()
+	}
+}
+
+// Disconnect cancels all per-node Lease, NodeStatus, and Watch loops and closes
+// their underlying HTTP/2 connections. When fastUnready is true, it also patches
+// NodeReady=Unknown via adminClient so KCM sees nodes NotReady immediately.
+func (s *Simulator) Disconnect(ctx context.Context, fastUnready bool) time.Duration {
+	start := time.Now()
+	s.disconnectCount.Add(1)
+	s.stopNodeSession()
+	if fastUnready {
+		s.markAllNodesReadyStatus(ctx, corev1.ConditionUnknown, "NodeStatusUnknown", "Kubelet stopped posting node status.")
+	}
+	d := time.Since(start).Round(time.Millisecond)
+	klog.Infof("Disconnected all %d simulated nodes in %v (fast-unready=%v, active-watches=%d)",
+		s.cfg.NumNodes, d, fastUnready, s.activeWatches.Load())
+	return d
+}
+
+// Reconnect simultaneously reconnects all simulated nodes to the control plane,
+// starting per-node Lease renewals, NodeStatus Ready=True updates, and
+// WatchList/watch streams across all full-watch nodes.
+func (s *Simulator) Reconnect(parentCtx context.Context) time.Duration {
+	start := time.Now()
+	s.reconnectCount.Add(1)
+	s.startNodeSession(parentCtx, true)
+	d := time.Since(start).Round(time.Millisecond)
+	klog.Infof("Triggered reconnect for all %d simulated nodes in %v (watch-mode=%s, node-agents=%v, stagger=%v)",
+		s.cfg.NumNodes, d, s.currentWatchMode(), s.nodeAgents.Load(), time.Duration(s.reconnectStagger.Load()))
+	return d
+}
+
+func (s *Simulator) startControlServer(ctx context.Context) {
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, syscall.SIGUSR1, syscall.SIGUSR2)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case sig := <-sigCh:
+				if sig == syscall.SIGUSR1 {
+					s.Disconnect(ctx, false)
+				} else if sig == syscall.SIGUSR2 {
+					s.Reconnect(ctx)
+				}
+			}
+		}
+	}()
+
+	if s.cfg.ControlAddr == "" {
+		return
+	}
+	mux := http.NewServeMux()
+	writeStatus := func(w http.ResponseWriter, action string, elapsed time.Duration) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"action":           action,
+			"elapsed":          elapsed.String(),
+			"nodes":            s.cfg.NumNodes,
+			"fullWatchNodes":   s.cfg.FullWatchNodes,
+			"disconnected":     s.disconnected.Load(),
+			"activeWatches":    s.activeWatches.Load(),
+			"watchMode":        s.currentWatchMode(),
+			"nodeAgents":       s.nodeAgents.Load(),
+			"reconnectStagger": time.Duration(s.reconnectStagger.Load()).String(),
+			"disconnectCount":  s.disconnectCount.Load(),
+			"reconnectCount":   s.reconnectCount.Load(),
+		})
+	}
+	applyQueryOverrides := func(r *http.Request) {
+		q := r.URL.Query()
+		if wm := strings.ToLower(q.Get("watch_mode")); wm == "watchlist" || wm == "rv0" || wm == "latest" {
+			s.watchMode.Store(wm)
+		}
+		if na := q.Get("node_agents"); na != "" {
+			s.nodeAgents.Store(na == "1" || strings.EqualFold(na, "true"))
+		}
+		if st := q.Get("stagger"); st != "" {
+			if d, err := time.ParseDuration(st); err == nil && d >= 0 {
+				s.reconnectStagger.Store(int64(d))
+			}
+		}
+	}
+	mux.HandleFunc("/disconnect", func(w http.ResponseWriter, r *http.Request) {
+		applyQueryOverrides(r)
+		q := r.URL.Query()
+		fast := q.Get("fast_unready") == "1" || strings.EqualFold(q.Get("fast_unready"), "true")
+		d := s.Disconnect(r.Context(), fast)
+		writeStatus(w, "disconnect", d)
+	})
+	mux.HandleFunc("/reconnect", func(w http.ResponseWriter, r *http.Request) {
+		applyQueryOverrides(r)
+		d := s.Reconnect(ctx)
+		writeStatus(w, "reconnect", d)
+	})
+	mux.HandleFunc("/status", func(w http.ResponseWriter, _ *http.Request) {
+		writeStatus(w, "status", 0)
+	})
+
+	srv := &http.Server{Addr: s.cfg.ControlAddr, Handler: mux}
+	go func() {
+		<-ctx.Done()
+		_ = srv.Close()
+	}()
+	go func() {
+		klog.Infof("kubelite control server listening on http://%s (/disconnect, /reconnect, /status; SIGUSR1=disconnect, SIGUSR2=reconnect)", s.cfg.ControlAddr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			klog.Warningf("control server %s exited: %v", s.cfg.ControlAddr, err)
+		}
+	}()
 }
 
 func (s *Simulator) maybeBindPVC(ctx context.Context, pvc *corev1.PersistentVolumeClaim) {
@@ -897,4 +1582,275 @@ func (s *Simulator) maybeBindPVC(ctx context.Context, pvc *corev1.PersistentVolu
 		},
 	}
 	_, _ = s.adminClient.CoreV1().PersistentVolumes().Create(ctx, pv, metav1.CreateOptions{})
+}
+
+func (s *Simulator) watchAndBindPVCs(ctx context.Context) {
+	lw := &cache.ListWatch{
+		WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+			return s.adminClient.CoreV1().PersistentVolumeClaims("").Watch(ctx, opts)
+		},
+	}
+	for ctx.Err() == nil {
+		list, err := s.adminClient.CoreV1().PersistentVolumeClaims("").List(ctx, metav1.ListOptions{ResourceVersion: "0"})
+		if err != nil || list.ResourceVersion == "" {
+			time.Sleep(time.Second)
+			continue
+		}
+		for i := range list.Items {
+			s.maybeBindPVC(ctx, &list.Items[i])
+		}
+		if rw, err := retrywatcher.NewRetryWatcherWithContext(ctx, list.ResourceVersion, lw); err == nil {
+			for ev := range rw.ResultChan() {
+				if pvc, ok := ev.Object.(*corev1.PersistentVolumeClaim); ok {
+					s.maybeBindPVC(ctx, pvc)
+				}
+			}
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+func (s *Simulator) Run(ctx context.Context) error {
+	start := time.Now()
+	s.ensureNodeWatchRBAC(ctx)
+	existingReady := make(map[string]types.UID, s.cfg.NumNodes)
+	if nodeList, err := s.adminClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{ResourceVersion: "0"}); err == nil && nodeList != nil {
+		if nodeList.ResourceVersion != "" {
+			s.latestRV.Store(nodeList.ResourceVersion)
+		}
+		for i := range nodeList.Items {
+			nd := &nodeList.Items[i]
+			for _, cond := range nd.Status.Conditions {
+				if cond.Type == corev1.NodeReady && cond.Status == corev1.ConditionTrue {
+					existingReady[nd.Name] = nd.UID
+					break
+				}
+			}
+		}
+	}
+	sem := make(chan struct{}, max(1, s.cfg.RegisterConcurrency))
+	var wg sync.WaitGroup
+	var firstErr atomic.Value
+	var registered atomic.Int64
+	now := metav1.Now()
+	for _, n := range s.nodes {
+		if uid, ok := existingReady[n.Name]; ok {
+			n.UID = uid
+			n.TransitionTime = now
+			registered.Add(1)
+			continue
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(node *SimNode) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if err := s.registerSingleNode(ctx, node); err != nil {
+				firstErr.CompareAndSwap(nil, err)
+				return
+			}
+			if cur := registered.Add(1); cur%5000 == 0 || cur == int64(s.cfg.NumNodes) {
+				klog.Infof("Registered %d/%d simulated nodes (%v elapsed)", cur, s.cfg.NumNodes, time.Since(start).Round(time.Millisecond))
+			}
+		}(n)
+	}
+	wg.Wait()
+	if v := firstErr.Load(); v != nil {
+		return v.(error)
+	}
+	klog.Infof("Registered %d simulated nodes in %v (full-watch-nodes=%d, shared-pod-watch=%v, watch-mode=%s, node-agents=%v)",
+		s.cfg.NumNodes, time.Since(start).Round(time.Millisecond), s.cfg.FullWatchNodes, s.cfg.SharedPodWatch, s.currentWatchMode(), s.nodeAgents.Load())
+
+	for w := 0; w < s.cfg.PodWorkers; w++ {
+		go s.podActuatorWorker(ctx)
+	}
+	go s.watchAndBindPVCs(ctx)
+	if s.cfg.SharedPodWatch {
+		go s.runSharedPodWatch(ctx)
+	}
+
+	s.startControlServer(ctx)
+	s.startNodeSession(ctx, false)
+
+	<-ctx.Done()
+	s.stopNodeSession()
+	if s.cfg.CleanupOnExit {
+		cctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		defer cancel()
+		_ = s.adminClient.CoreV1().Nodes().DeleteCollection(cctx, metav1.DeleteOptions{}, metav1.ListOptions{LabelSelector: simulatedLabelKey + "=true"})
+	}
+	return nil
+}
+
+func NewSimulator(cfg Config) (*Simulator, error) {
+	cfg.Kubeconfig = resolveKubeconfigPath(cfg.Kubeconfig)
+	restCfg, err := clientcmd.BuildConfigFromFlags("", cfg.Kubeconfig)
+	if err != nil {
+		return nil, fmt.Errorf("loading kubeconfig %q: %w", cfg.Kubeconfig, err)
+	}
+	if cfg.APIServerURL != "" {
+		restCfg.Host = cfg.APIServerURL
+	}
+	restCfg.QPS, restCfg.Burst = 10000, 20000
+	restCfg.ContentType = k8sruntime.ContentTypeProtobuf
+	restCfg.AcceptContentTypes = k8sruntime.ContentTypeProtobuf + "," + k8sruntime.ContentTypeJSON
+
+	adminClient, err := kubernetes.NewForConfig(restCfg)
+	if err != nil {
+		return nil, err
+	}
+	u, err := url.Parse(restCfg.Host)
+	if err != nil {
+		return nil, err
+	}
+	tlsCfg, err := rest.TLSConfigFor(restCfg)
+	if err != nil {
+		return nil, err
+	}
+	tlsCfg.NextProtos = []string{"h2", "http/1.1"}
+	tlsCfg.ClientSessionCache = tls.NewLRUClientSessionCache(512)
+
+	var tokensByUser map[string]string
+	nodeTLSConfig := tlsCfg
+	if cfg.TokensFile != "" {
+		tokensByUser, err = loadNodeTokens(cfg.TokensFile)
+		if err != nil {
+			return nil, fmt.Errorf("loading tokens file %q: %w", cfg.TokensFile, err)
+		}
+		// Strip client certificate so kube-apiserver authenticates via Bearer token
+		// (hitting NodeAuthorizer) instead of X509 kubernetes-admin.
+		nodeTLSConfig = tlsCfg.Clone()
+		nodeTLSConfig.Certificates = nil
+		nodeTLSConfig.GetClientCertificate = nil
+	}
+
+	sim := &Simulator{
+		cfg:           cfg,
+		baseURL:       strings.TrimRight(restCfg.Host, "/"),
+		isLoopback:    u.Hostname() == "127.0.0.1" || u.Hostname() == "localhost",
+		adminClient:   adminClient,
+		tlsConfig:     tlsCfg,
+		nodeTLSConfig: nodeTLSConfig,
+		nodesByName:   make(map[string]*SimNode, cfg.NumNodes),
+		nodes:         make([]*SimNode, cfg.NumNodes),
+		podWorkCh:     make(chan *corev1.Pod, max(131072, cfg.NumNodes*8)),
+		podMutateSem:  make(chan struct{}, max(1, cfg.MaxInflightMut)),
+		eventSem:      make(chan struct{}, max(128, cfg.MaxInflightMut)),
+	}
+	sim.watchMode.Store(strings.ToLower(cfg.WatchMode))
+	sim.nodeAgents.Store(cfg.SimulateNodeAgents)
+	sim.reconnectStagger.Store(int64(cfg.ReconnectStagger))
+
+	if cfg.FullWatchNodes > 0 && cfg.FullWatchNodes < cfg.NumNodes {
+		sim.sparseTransports = make([]*http.Transport, sparseTransportCnt)
+		for i := range sim.sparseTransports {
+			sim.sparseTransports[i] = sim.newTransport(cfg.FullWatchNodes*2 + i)
+		}
+	}
+
+	capList := corev1.ResourceList{
+		corev1.ResourceCPU:              resource.MustParse("4"),
+		corev1.ResourceMemory:           resource.MustParse("16Gi"),
+		corev1.ResourcePods:             resource.MustParse("110"),
+		corev1.ResourceEphemeralStorage: resource.MustParse("100Gi"),
+	}
+	if cfg.NodeAccelerators > 0 {
+		capList[corev1.ResourceName("kubelite.k8s.io/tpu")] = resource.MustParse(fmt.Sprintf("%d", cfg.NodeAccelerators))
+	}
+
+	nodeRestCfg := rest.CopyConfig(restCfg)
+	nodeRestCfg.RateLimiter = flowcontrol.NewFakeAlwaysRateLimiter()
+	if cfg.TokensFile != "" {
+		nodeRestCfg.CertData, nodeRestCfg.KeyData = nil, nil
+		nodeRestCfg.CertFile, nodeRestCfg.KeyFile = "", ""
+		nodeRestCfg.BearerToken, nodeRestCfg.BearerTokenFile = "", ""
+	}
+	zones := []string{"us-east1-b", "us-east1-c", "us-east1-d"}
+
+	for i := 0; i < cfg.NumNodes; i++ {
+		name := formatNodeName(cfg.NodePrefix, i, cfg.NumNodes)
+		var kubeletHTTP, kubeProxyHTTP *http.Client
+		isFull := sim.isFullWatchNodeIndex(i)
+		if cfg.TokensFile != "" {
+			tok := tokensByUser["system:node:"+name]
+			if tok == "" {
+				tok = "token-" + name
+			}
+			kubeletHTTP = sim.newNodeHTTPClient(i*2, isFull, "", nil, tok, kubeletUserAgent)
+			if isFull {
+				kubeProxyHTTP = sim.newNodeHTTPClient(i*2+1, true, "", nil, tok, kubeProxyUserAgent)
+			} else {
+				kubeProxyHTTP = kubeletHTTP
+			}
+		} else {
+			kubeletHTTP = sim.newNodeHTTPClient(i*2, isFull, "system:node:"+name, []string{"system:nodes", "system:authenticated"}, restCfg.BearerToken, kubeletUserAgent)
+			if isFull {
+				kubeProxyHTTP = sim.newNodeHTTPClient(i*2+1, true, "system:kube-proxy", []string{"system:authenticated"}, restCfg.BearerToken, kubeProxyUserAgent)
+			} else {
+				kubeProxyHTTP = kubeletHTTP
+			}
+		}
+		kubeletClient, err := kubernetes.NewForConfigAndClient(nodeRestCfg, kubeletHTTP)
+		if err != nil {
+			return nil, err
+		}
+		internalIP := fmt.Sprintf("10.%d.%d.%d", 128+(i/(250*250)), (i/250)%250+1, (i%250)+2)
+		n := &SimNode{
+			Index: i, Name: name, InternalIP: internalIP,
+			Zone: zones[i%len(zones)], KubeletClient: kubeletClient, KubeletHTTP: kubeletHTTP, KubeProxyHTTP: kubeProxyHTTP, Capacity: capList,
+			volRefCnt: make(map[string]int), volCancels: make(map[string]context.CancelFunc), podVols: make(map[types.UID][]string),
+		}
+		sim.nodes[i], sim.nodesByName[name] = n, n
+	}
+	return sim, nil
+}
+
+func main() {
+	var cfg Config
+	flag.StringVar(&cfg.Kubeconfig, "kubeconfig", defaultKubeconfigPath(), "Path to kubeconfig (defaults to /var/lib/kubelite/kubeconfig with fallback to ~/.kube/kubelite-config)")
+	flag.StringVar(&cfg.APIServerURL, "apiserver-url", "", "Optional apiserver URL override (e.g. https://172.18.0.2:6443)")
+	flag.StringVar(&cfg.TokensFile, "tokens-file", "", "Optional known_tokens.csv path for per-node Bearer token authentication")
+	flag.StringVar(&cfg.ControlAddr, "control-addr", "127.0.0.1:18080", "HTTP control address for /disconnect, /reconnect, and /status (empty to disable)")
+	flag.StringVar(&cfg.WatchMode, "watch-mode", "watchlist", "Watch initialization mode on boot and reconnect: watchlist (sendInitialEvents=true), rv0 (resourceVersion=0), or latest")
+	flag.IntVar(&cfg.NumNodes, "nodes", 5000, "Number of simulated nodes")
+	flag.StringVar(&cfg.NodePrefix, "node-prefix", "kubelite-", "Simulated node name prefix")
+	flag.StringVar(&cfg.PVCNamespacePrefix, "pvc-namespace-prefix", "test-", "Namespace prefix for auto-binding Pending PVCs")
+	flag.IntVar(&cfg.PodCIDRBaseOctet, "pod-cidr-base-octet", 64, "Second IPv4 octet base for /26 node PodCIDRs (10.<base>.0.0/10)")
+	flag.IntVar(&cfg.RegisterConcurrency, "register-concurrency", 128, "Concurrency for initial node registration")
+	flag.IntVar(&cfg.PodWorkers, "pod-workers", 512, "Concurrent workers actuating pod lifecycle transitions")
+	flag.IntVar(&cfg.MaxInflightMut, "max-inflight-pod-mutations", 96, "Max concurrent in-flight pod status/event/delete mutations")
+	flag.IntVar(&cfg.PodStatusStages, "pod-status-stages", 3, "Number of PodStatus PATCH stages per pod startup (1 or 3)")
+	flag.IntVar(&cfg.FullWatchNodes, "full-watch-nodes", 0, "Number of nodes opening full per-node watch streams and 10s lease loops (0 = all nodes)")
+	flag.IntVar(&cfg.NodeAccelerators, "node-accelerators", 0, "Number of kubelite.k8s.io/tpu resources per node")
+	flag.DurationVar(&cfg.LeaseInterval, "lease-interval", 10*time.Second, "Per-node Lease heartbeat interval for full-watch nodes")
+	flag.DurationVar(&cfg.SparseLeaseInterval, "sparse-lease-interval", 180*time.Second, "Per-node Lease heartbeat interval for sparse nodes (>= full-watch-nodes)")
+	flag.DurationVar(&cfg.NodeStatusInterval, "node-status-interval", 240*time.Second, "Per-node NodeStatus PATCH interval for full-watch nodes")
+	flag.DurationVar(&cfg.SparseNodeStatusInterval, "sparse-node-status-interval", 180*time.Second, "Per-node NodeStatus PATCH interval for sparse nodes (0 = only at registration)")
+	flag.DurationVar(&cfg.PodStartupDelay, "pod-startup-delay", 150*time.Millisecond, "Minimum delay before patching PodStatus")
+	flag.DurationVar(&cfg.Jitter, "pod-startup-jitter", 350*time.Millisecond, "Random startup jitter added to pod-startup-delay")
+	flag.DurationVar(&cfg.ReconnectStagger, "reconnect-stagger", 500*time.Millisecond, "Stagger window across nodes when reconnecting after /disconnect")
+	flag.BoolVar(&cfg.TaintSimulated, "taint-simulated", true, "Taint simulated nodes with kubelite.io/simulated=true:NoSchedule")
+	flag.BoolVar(&cfg.CleanupOnExit, "cleanup-on-exit", false, "Delete simulated nodes on SIGINT/SIGTERM")
+	flag.BoolVar(&cfg.SharedPodWatch, "shared-pod-watch", false, "Use a single cluster-wide Pod watch for pod actuation (auto-enabled when --full-watch-nodes > 0)")
+	flag.BoolVar(&cfg.SkipPrePatchGet, "skip-pre-patch-get", false, "Skip GET /pods/{name} before first PodStatus PATCH attempt")
+	flag.BoolVar(&cfg.EmitPodEvents, "emit-pod-events", true, "Emit Pod Pulled/Created/Started Events")
+	flag.BoolVar(&cfg.RequestPodTokens, "request-pod-tokens", true, "Issue POST /serviceaccounts/{sa}/token per pod startup")
+	flag.BoolVar(&cfg.SimulateNodeAgents, "simulate-node-agents", false, "Also open cilium-agent, netd, autoscaling-metrics-pipeline Pod WatchLists and 3 Prometheus/ namespace LIST+WATCH streams per full-watch node")
+	klog.InitFlags(nil)
+	flag.Parse()
+
+	if cfg.FullWatchNodes > 0 {
+		cfg.SharedPodWatch = true
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	sim, err := NewSimulator(cfg)
+	if err != nil {
+		klog.Fatalf("Failed to initialize kubelite: %v", err)
+	}
+	if err := sim.Run(ctx); err != nil && ctx.Err() == nil {
+		klog.Fatalf("kubelite failed: %v", err)
+	}
 }
