@@ -33,16 +33,13 @@ docker run --rm --privileged -v "$(dirname "${DATA_DIR}"):/host_var_lib" --entry
 "
 
 echo "=== [2/5] Generating ${NUM_NODES} per-node static tokens (system:node:<name> in system:nodes) ==="
-python3 -c '
-import sys
-n = int(sys.argv[1])
-prefix = sys.argv[2]
-width = 5 if n >= 10000 else 4
-with open(sys.argv[3], "w") as f:
-    for i in range(n):
-        name = f"{prefix}{i:0{width}d}"
-        f.write(f"token-{name},system:node:{name},uid-{name},\"system:nodes\"\n")
-' "${NUM_NODES}" "${NODE_PREFIX}" "${DATA_DIR}/tokens/known_tokens.csv"
+awk -v n="${NUM_NODES}" -v prefix="${NODE_PREFIX}" 'BEGIN {
+  fmt = (n >= 10000) ? "%s%05d" : "%s%04d"
+  for (i = 0; i < n; i++) {
+    name = sprintf(fmt, prefix, i)
+    printf "token-%s,system:node:%s,uid-%s,\"system:nodes\"\n", name, name, name
+  }
+}' > "${DATA_DIR}/tokens/known_tokens.csv"
 chmod -R a+rX "${DATA_DIR}/tokens"
 
 echo "=== [3/5] Creating 1-node kind control-plane (${CLUSTER_NAME}) with ${SCALE} scale flags ==="

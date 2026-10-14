@@ -22,6 +22,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -493,5 +495,51 @@ func Test5kBenchmarkFidelityInvariants(t *testing.T) {
 	n.volMu.Unlock()
 	if remainingVolWatches != 0 {
 		t.Fatalf("expected 0 remaining volume watches after pod deletion, got %d", remainingVolWatches)
+	}
+}
+
+func TestLaptopDefaultsAndEmbeddedSubcommands(t *testing.T) {
+	if shouldShardLoopbackIPs(true, "darwin", 5000) {
+		t.Fatalf("expected darwin to disable 127.x.y.z loopback source-IP sharding")
+	}
+	if shouldShardLoopbackIPs(true, "linux", 100) {
+		t.Fatalf("expected <=1000 nodes on linux to disable 127.x.y.z loopback source-IP sharding")
+	}
+	if !shouldShardLoopbackIPs(true, "linux", 5000) {
+		t.Fatalf("expected >1000 nodes on linux loopback to enable 127.x.y.z source-IP sharding")
+	}
+
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("KUBECONFIG", "")
+	kubeDir := filepath.Join(tmpHome, ".kube")
+	if err := os.MkdirAll(kubeDir, 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	stdKubeconfig := filepath.Join(kubeDir, "config")
+	if err := os.WriteFile(stdKubeconfig, []byte("apiVersion: v1\nkind: Config\n"), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if got := resolveKubeconfigPath("/nonexistent/kubelite/kubeconfig"); got != stdKubeconfig {
+		t.Fatalf("expected resolveKubeconfigPath to fall back to ~/.kube/config (%q), got %q", stdKubeconfig, got)
+	}
+
+	if len(embeddedKind5kYAML) == 0 || len(embeddedKind65kYAML) == 0 || len(embeddedUpScript) == 0 || len(embeddedHotswapScript) == 0 {
+		t.Fatalf("expected all //go:embed assets to be non-empty")
+	}
+
+	ctrlSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"action":"` + strings.TrimPrefix(r.URL.Path, "/") + `","query":"` + r.URL.RawQuery + `"}`))
+	}))
+	defer ctrlSrv.Close()
+
+	addr := strings.TrimPrefix(ctrlSrv.URL, "http://")
+	out, err := runControlSubcommand("reconnect", []string{"--control-addr=" + addr, "--watch-mode=watchlist", "--node-agents=true"})
+	if err != nil {
+		t.Fatalf("runControlSubcommand: %v", err)
+	}
+	if !strings.Contains(out, `"action":"reconnect"`) || !strings.Contains(out, "watch_mode=watchlist") || !strings.Contains(out, "node_agents=true") {
+		t.Fatalf("unexpected control subcommand output: %s", out)
 	}
 }

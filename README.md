@@ -1,5 +1,7 @@
 # Kubelite: High-Fidelity Node Simulator for Kubernetes Control-Plane Scalability
 
+[![CI](https://github.com/Jefftree/kubelite/actions/workflows/ci.yaml/badge.svg)](https://github.com/Jefftree/kubelite/actions/workflows/ci.yaml)
+
 ## Summary
 
 Testing Kubernetes control-plane changes at 5,000 to 65,000 nodes traditionally forces an ugly tradeoff between cost and fidelity. Real 5,000-node GCE clusters take 64 minutes just to boot 5,000 worker VMs (`10,000` vCPUs, `20 TB` RAM), while existing simulators either require an 84-VM host cluster and drop 70% of kubelet events (`kubemark`) or collapse all 5,000 nodes into a single watch connection with zero per-node fanout (`kwok`).
@@ -39,29 +41,34 @@ flowchart LR
 ## Quickstart
 
 ```bash
-# 1. Boot the tuned 1-node kind control plane (/var/lib/kubelite/kubeconfig)
-./up-5k-control-plane.sh
+# Install the single self-contained binary (embeds kind configs and hotswap scripts)
+CGO_ENABLED=0 go install github.com/Jefftree/kubelite@latest
 
-# 2. Build and run kubelite (5,000 nodes with per-node static tokens)
-CGO_ENABLED=0 go build -o kubelite .
-GOMAXPROCS=48 taskset -c 96-143 ./kubelite \
+# Laptop quickstart: attach 100 simulated nodes to any existing ~/.kube/config cluster
+kind create cluster
+kubelite --nodes=100
+
+# 5,000-node scale benchmark: boot tuned 1-node kind control plane + run 5k nodes
+kubelite up --scale=5k
+GOMAXPROCS=48 taskset -c 96-143 kubelite \
   --kubeconfig=/var/lib/kubelite/kubeconfig \
   --tokens-file=/var/lib/kubelite/tokens/known_tokens.csv \
   --nodes=5000
 
-# 3. Optional: hot-swap a custom static kube-apiserver binary in <3 seconds
-K8S_WORKTREE=/path/to/kubernetes ./hotswap-apiserver.sh
+# Optional: hot-swap a custom static kube-apiserver binary in <3 seconds
+kubelite hotswap /path/to/kube-apiserver
 
-# 4. Trigger a 5,000-node disconnect / WatchList reconnect storm
-curl -s -X POST http://127.0.0.1:18080/disconnect
-curl -s -X POST "http://127.0.0.1:18080/reconnect?watch_mode=watchlist&node_agents=true"
+# Trigger a 5,000-node disconnect / WatchList reconnect storm
+kubelite disconnect
+kubelite reconnect --watch-mode=watchlist --node-agents=true
+kubelite status
 ```
 
 To boot a 65,000-node control plane with 3-way split `etcd` (`main`, `events`, `leases`) and hybrid watch fanout (`2,000` full-watch nodes + `63,000` sparse nodes):
 
 ```bash
-SCALE=65k ./up-5k-control-plane.sh
-./kubelite \
+kubelite up --scale=65k
+kubelite \
   --kubeconfig=/var/lib/kubelite/kubeconfig \
   --tokens-file=/var/lib/kubelite/tokens/known_tokens.csv \
   --nodes=65000 \

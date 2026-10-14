@@ -34,6 +34,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	_ "embed"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -43,8 +44,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -181,11 +184,27 @@ type Simulator struct {
 	reconnectCount   atomic.Int64
 }
 
-func fallbackKubeconfigPath() string {
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		return filepath.Join(home, ".kube", "kubelite-config")
+//go:embed kind-5k-scale.yaml
+var embeddedKind5kYAML []byte
+
+//go:embed kind-65k-scale.yaml
+var embeddedKind65kYAML []byte
+
+//go:embed up-5k-control-plane.sh
+var embeddedUpScript []byte
+
+//go:embed hotswap-apiserver.sh
+var embeddedHotswapScript []byte
+
+func fallbackKubeconfigPaths() []string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return nil
 	}
-	return defaultKubeconfigVarLib
+	return []string{
+		filepath.Join(home, ".kube", "kubelite-config"),
+		filepath.Join(home, ".kube", "config"),
+	}
 }
 
 func defaultKubeconfigPath() string {
@@ -195,7 +214,7 @@ func defaultKubeconfigPath() string {
 	if _, err := os.Stat(defaultKubeconfigVarLib); err == nil {
 		return defaultKubeconfigVarLib
 	}
-	if fb := fallbackKubeconfigPath(); fb != defaultKubeconfigVarLib {
+	for _, fb := range fallbackKubeconfigPaths() {
 		if _, err := os.Stat(fb); err == nil {
 			return fb
 		}
@@ -210,9 +229,11 @@ func resolveKubeconfigPath(configured string) string {
 	if _, err := os.Stat(configured); err == nil {
 		return configured
 	}
-	if fb := fallbackKubeconfigPath(); fb != configured {
-		if _, err := os.Stat(fb); err == nil {
-			return fb
+	for _, fb := range fallbackKubeconfigPaths() {
+		if fb != configured {
+			if _, err := os.Stat(fb); err == nil {
+				return fb
+			}
 		}
 	}
 	return configured
@@ -377,9 +398,13 @@ func (s *Simulator) getLatestRV(ctx context.Context) string {
 	return "0"
 }
 
+func shouldShardLoopbackIPs(isLoopback bool, goos string, numNodes int) bool {
+	return isLoopback && goos == "linux" && numNodes > 1000
+}
+
 func (s *Simulator) newTransport(connIdx int) *http.Transport {
 	dialer := &net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}
-	if s.isLoopback {
+	if shouldShardLoopbackIPs(s.isLoopback, runtime.GOOS, s.cfg.NumNodes) {
 		b1 := byte(1 + (connIdx/40000)%250)
 		b2 := byte(1 + (connIdx/200)%200)
 		b3 := byte(1 + (connIdx % 200))
@@ -1837,9 +1862,154 @@ func NewSimulator(cfg Config) (*Simulator, error) {
 	return sim, nil
 }
 
+func runEmbeddedScript(scriptName string, scriptBytes []byte, extraEnv []string) error {
+	dir, err := os.MkdirTemp("", "kubelite-cmd-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+
+	assets := map[string][]byte{
+		"kind-5k-scale.yaml":     embeddedKind5kYAML,
+		"kind-65k-scale.yaml":    embeddedKind65kYAML,
+		"up-5k-control-plane.sh": embeddedUpScript,
+		"hotswap-apiserver.sh":   embeddedHotswapScript,
+	}
+	for name, data := range assets {
+		mode := os.FileMode(0644)
+		if strings.HasSuffix(name, ".sh") {
+			mode = 0755
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), data, mode); err != nil {
+			return err
+		}
+	}
+	cmd := exec.Command("bash", filepath.Join(dir, scriptName))
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	cmd.Env = append(os.Environ(), extraEnv...)
+	return cmd.Run()
+}
+
+func runUpSubcommand(args []string) error {
+	fs := flag.NewFlagSet("up", flag.ContinueOnError)
+	scale := fs.String("scale", "5k", "Control-plane scale preset: 5k or 65k")
+	clusterName := fs.String("cluster-name", "", "Optional kind cluster name override")
+	numNodes := fs.Int("nodes", 0, "Optional static token count override")
+	dataDir := fs.String("data-dir", "", "Optional host directory for etcd and kubeconfig (default /var/lib/kubelite)")
+	apiserverBin := fs.String("apiserver-bin", "", "Optional custom kube-apiserver binary to hotswap after cluster creation")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	env := []string{"SCALE=" + *scale}
+	if *clusterName != "" {
+		env = append(env, "CLUSTER_NAME="+*clusterName)
+	}
+	if *numNodes > 0 {
+		env = append(env, fmt.Sprintf("NUM_NODES=%d", *numNodes))
+	}
+	if *dataDir != "" {
+		env = append(env, "DATA_DIR="+*dataDir)
+	}
+	if *apiserverBin != "" {
+		env = append(env, "CUSTOM_APISERVER_BIN="+*apiserverBin)
+	}
+	return runEmbeddedScript("up-5k-control-plane.sh", embeddedUpScript, env)
+}
+
+func runHotswapSubcommand(args []string) error {
+	fs := flag.NewFlagSet("hotswap", flag.ContinueOnError)
+	clusterName := fs.String("cluster-name", "kubelite-5k", "Target kind cluster name")
+	apiserverBin := fs.String("apiserver-bin", "", "Path to static kube-apiserver binary")
+	worktree := fs.String("k8s-worktree", "", "Path to kubernetes source checkout if building kube-apiserver")
+	rebuild := fs.Bool("rebuild", false, "Rebuild kube-apiserver with CGO_ENABLED=0 before swapping")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *apiserverBin == "" && fs.NArg() > 0 {
+		*apiserverBin = fs.Arg(0)
+	}
+	env := []string{"CLUSTER_NAME=" + *clusterName}
+	if *apiserverBin != "" {
+		env = append(env, "APISERVER_BIN="+*apiserverBin)
+	}
+	if *worktree != "" {
+		env = append(env, "K8S_WORKTREE="+*worktree)
+	}
+	if *rebuild {
+		env = append(env, "REBUILD_APISERVER=1")
+	}
+	return runEmbeddedScript("hotswap-apiserver.sh", embeddedHotswapScript, env)
+}
+
+func runControlSubcommand(action string, args []string) (string, error) {
+	fs := flag.NewFlagSet(action, flag.ContinueOnError)
+	addr := fs.String("control-addr", "127.0.0.1:18080", "kubelite HTTP control server address")
+	fastUnready := fs.Bool("fast-unready", false, "Immediately patch NodeReady=Unknown on disconnect")
+	watchMode := fs.String("watch-mode", "", "Override watch mode on reconnect: watchlist, rv0, or latest")
+	nodeAgents := fs.String("node-agents", "", "Override simulated node agents on reconnect: true or false")
+	stagger := fs.String("stagger", "", "Override reconnect stagger window (e.g. 500ms)")
+	if err := fs.Parse(args); err != nil {
+		return "", err
+	}
+	q := url.Values{}
+	if *fastUnready {
+		q.Set("fast_unready", "1")
+	}
+	if *watchMode != "" {
+		q.Set("watch_mode", *watchMode)
+	}
+	if *nodeAgents != "" {
+		q.Set("node_agents", *nodeAgents)
+	}
+	if *stagger != "" {
+		q.Set("stagger", *stagger)
+	}
+	reqURL := fmt.Sprintf("http://%s/%s", strings.TrimPrefix(strings.TrimPrefix(*addr, "http://"), "https://"), action)
+	if enc := q.Encode(); enc != "" {
+		reqURL += "?" + enc
+	}
+	resp, err := http.Get(reqURL)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return strings.TrimSpace(string(body)), nil
+}
+
 func main() {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "up":
+			if err := runUpSubcommand(os.Args[2:]); err != nil {
+				klog.Fatalf("kubelite up failed: %v", err)
+			}
+			return
+		case "hotswap":
+			if err := runHotswapSubcommand(os.Args[2:]); err != nil {
+				klog.Fatalf("kubelite hotswap failed: %v", err)
+			}
+			return
+		case "disconnect", "reconnect", "status":
+			out, err := runControlSubcommand(os.Args[1], os.Args[2:])
+			if err != nil {
+				klog.Fatalf("kubelite %s failed: %v", os.Args[1], err)
+			}
+			fmt.Println(out)
+			return
+		}
+	}
+
 	var cfg Config
-	flag.StringVar(&cfg.Kubeconfig, "kubeconfig", defaultKubeconfigPath(), "Path to kubeconfig (defaults to /var/lib/kubelite/kubeconfig with fallback to ~/.kube/kubelite-config)")
+	flag.StringVar(&cfg.Kubeconfig, "kubeconfig", defaultKubeconfigPath(), "Path to kubeconfig (defaults to /var/lib/kubelite/kubeconfig with fallback to ~/.kube/kubelite-config and ~/.kube/config)")
 	flag.StringVar(&cfg.APIServerURL, "apiserver-url", "", "Optional apiserver URL override (e.g. https://172.18.0.2:6443)")
 	flag.StringVar(&cfg.TokensFile, "tokens-file", "", "Optional known_tokens.csv path for per-node Bearer token authentication")
 	flag.StringVar(&cfg.ControlAddr, "control-addr", "127.0.0.1:18080", "HTTP control address for /disconnect, /reconnect, and /status (empty to disable)")
