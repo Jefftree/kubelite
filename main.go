@@ -987,6 +987,7 @@ func (s *Simulator) patchPodStatusStage(ctx context.Context, n *SimNode, pod *co
 			attempt++
 			if !skipFirstGet || attempt > 1 {
 				if latest, err := n.KubeletClient.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{}); err == nil && latest != nil {
+					trimPodForSimulator(latest)
 					pod = latest
 				} else if apierrors.IsNotFound(err) {
 					return nil
