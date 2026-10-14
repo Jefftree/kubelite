@@ -339,7 +339,27 @@ func (s *Simulator) currentWatchMode() string {
 			return m
 		}
 	}
-	return "watchlist"
+	return "rv0"
+}
+
+func (s *Simulator) fetchLatestRV(ctx context.Context, client *http.Client, watchURL string) string {
+	if s.cfg.SharedPodWatch || s.cfg.FullWatchNodes > 0 {
+		return s.getLatestRV(ctx)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.Replace(watchURL, "watch=true", "limit=1&resourceVersion=0", 1), nil)
+	if err != nil {
+		return ""
+	}
+	resp, err := client.Do(req)
+	if err != nil || resp == nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	var meta struct {
+		Metadata metav1.ListMeta `json:"metadata"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&meta)
+	return meta.Metadata.ResourceVersion
 }
 
 func (s *Simulator) getLatestRV(ctx context.Context) string {
@@ -408,7 +428,10 @@ func (s *Simulator) nodePodCIDR(nodeIndex int) string {
 	if base <= 0 {
 		base = 64
 	}
-	return fmt.Sprintf("10.%d.%d.%d/26", base+(nodeIndex/1024), (nodeIndex/4)%256, (nodeIndex%4)*64)
+	if s.cfg.NumNodes > 16000 || nodeIndex >= 16000 {
+		return fmt.Sprintf("10.%d.%d.%d/26", base+(nodeIndex/1024), (nodeIndex/4)%256, (nodeIndex%4)*64)
+	}
+	return fmt.Sprintf("10.%d.%d.0/24", base+(nodeIndex/256), nodeIndex%256)
 }
 
 func (s *Simulator) nodePodIP(nodeIndex int, uid types.UID) string {
@@ -416,11 +439,18 @@ func (s *Simulator) nodePodIP(nodeIndex int, uid types.UID) string {
 	if base <= 0 {
 		base = 64
 	}
+	if s.cfg.NumNodes > 16000 || nodeIndex >= 16000 {
+		hostOffset := 2
+		if len(uid) > 0 {
+			hostOffset += int(uid[0]) % 60
+		}
+		return fmt.Sprintf("10.%d.%d.%d", base+(nodeIndex/1024), (nodeIndex/4)%256, (nodeIndex%4)*64+hostOffset)
+	}
 	hostOffset := 2
 	if len(uid) > 0 {
-		hostOffset += int(uid[0]) % 60
+		hostOffset += int(uid[0]) % 250
 	}
-	return fmt.Sprintf("10.%d.%d.%d", base+(nodeIndex/1024), (nodeIndex/4)%256, (nodeIndex%4)*64+hostOffset)
+	return fmt.Sprintf("10.%d.%d.%d", base+(nodeIndex/256), nodeIndex%256, hostOffset)
 }
 
 func (s *Simulator) buildNode(n *SimNode, hb metav1.Time) *corev1.Node {
@@ -663,9 +693,11 @@ func (s *Simulator) runWatchStream(ctx context.Context, client *http.Client, del
 			_, copyErr := io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
 			s.activeWatches.Add(-1)
+			// Only transition out of initial-events mode if the stream stayed open
+			// past initial sync (or cleanly hit server watch timeout).
 			if copyErr == nil || time.Since(streamStart) >= watchListSteadyStateMin {
 				synced = true
-				if latest := s.getLatestRV(ctx); latest != "" {
+				if latest := s.fetchLatestRV(ctx, client, watchURL); latest != "" {
 					rv = latest
 				}
 			}
@@ -676,7 +708,7 @@ func (s *Simulator) runWatchStream(ctx context.Context, client *http.Client, del
 				return
 			}
 			if synced {
-				if latest := s.getLatestRV(ctx); latest != "" {
+				if latest := s.fetchLatestRV(ctx, client, watchURL); latest != "" {
 					rv = latest
 				}
 			}
@@ -1075,10 +1107,10 @@ func (s *Simulator) podActuatorWorker(ctx context.Context) {
 					if nCont > 1 && len(pod.UID) > 0 && pod.UID[0]%2 == 0 {
 						s.emitPodEvent(ctx, n, pod, "Killing", "Stopping container "+pod.Spec.Containers[0].Name)
 					}
-					_ = s.patchPodStatusStage(ctx, n, pod, corev1.PodRunning, -1, nInit, 0, false, "", true, true)
 				}
+				_ = s.patchPodStatusStage(ctx, n, pod, corev1.PodRunning, -1, nInit, 0, false, "", true, true)
 				if err := s.withMutateSem(ctx, func() error {
-					if !s.cfg.SkipPrePatchGet && s.cfg.PodStatusStages >= 3 {
+					if !s.cfg.SkipPrePatchGet {
 						_, _ = n.KubeletClient.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
 					}
 					return retryWithExponentialBackOff(func() error {
@@ -1811,7 +1843,7 @@ func main() {
 	flag.StringVar(&cfg.APIServerURL, "apiserver-url", "", "Optional apiserver URL override (e.g. https://172.18.0.2:6443)")
 	flag.StringVar(&cfg.TokensFile, "tokens-file", "", "Optional known_tokens.csv path for per-node Bearer token authentication")
 	flag.StringVar(&cfg.ControlAddr, "control-addr", "127.0.0.1:18080", "HTTP control address for /disconnect, /reconnect, and /status (empty to disable)")
-	flag.StringVar(&cfg.WatchMode, "watch-mode", "watchlist", "Watch initialization mode on boot and reconnect: watchlist (sendInitialEvents=true), rv0 (resourceVersion=0), or latest")
+	flag.StringVar(&cfg.WatchMode, "watch-mode", "rv0", "Watch initialization mode on boot and reconnect: rv0 (resourceVersion=0, 5k CI default), watchlist (sendInitialEvents=true), or latest")
 	flag.IntVar(&cfg.NumNodes, "nodes", 5000, "Number of simulated nodes")
 	flag.StringVar(&cfg.NodePrefix, "node-prefix", "kubelite-", "Simulated node name prefix")
 	flag.StringVar(&cfg.PVCNamespacePrefix, "pvc-namespace-prefix", "test-", "Namespace prefix for auto-binding Pending PVCs")
