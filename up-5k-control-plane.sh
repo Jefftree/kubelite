@@ -29,6 +29,7 @@ docker run --rm --privileged -v "$(dirname "${DATA_DIR}"):/host_var_lib" --entry
   sysctl -w fs.inotify.max_user_instances=8192 fs.inotify.max_user_watches=4194304 net.ipv4.ip_local_port_range='1024 65535' >/dev/null 2>&1 || true
   mkdir -p '/host_var_lib/$(basename "${DATA_DIR}")/etcd-main' '/host_var_lib/$(basename "${DATA_DIR}")/etcd-events' '/host_var_lib/$(basename "${DATA_DIR}")/etcd-leases' '/host_var_lib/$(basename "${DATA_DIR}")/tokens' &&
   rm -rf '/host_var_lib/$(basename "${DATA_DIR}")/etcd-main/'* '/host_var_lib/$(basename "${DATA_DIR}")/etcd-events/'* '/host_var_lib/$(basename "${DATA_DIR}")/etcd-leases/'* '/host_var_lib/$(basename "${DATA_DIR}")/tokens/'* &&
+  chown -R $(id -u):$(id -g) '/host_var_lib/$(basename "${DATA_DIR}")' &&
   chmod -R 777 '/host_var_lib/$(basename "${DATA_DIR}")'
 "
 
@@ -40,7 +41,7 @@ awk -v n="${NUM_NODES}" -v prefix="${NODE_PREFIX}" 'BEGIN {
     printf "token-%s,system:node:%s,uid-%s,\"system:nodes\"\n", name, name, name
   }
 }' > "${DATA_DIR}/tokens/known_tokens.csv"
-chmod -R a+rX "${DATA_DIR}/tokens"
+chmod 644 "${DATA_DIR}/tokens/known_tokens.csv"
 
 echo "=== [3/5] Creating 1-node kind control-plane (${CLUSTER_NAME}) with ${SCALE} scale flags ==="
 if kind get clusters 2>/dev/null | grep -qx "${CLUSTER_NAME}"; then
