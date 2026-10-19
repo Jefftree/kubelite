@@ -96,5 +96,6 @@ kubelite \
 Engineering decision records and empirical scale studies are checked in alongside the code under [`studies/`](studies/):
 
 - [2026-10-08: 5,000-Node Fidelity Validation Against Real GCE CI](studies/2026-10-08-5k-fidelity-validation.md)
-- [2026-10-08: 10 KB vs 30 KB RealisticPod Scaling at 5,000 and 65,000 Nodes](studies/2026-10-08-30kb-realistic-pod-scaling.md)
+- [2026-10-08: 10 KB vs 30 KB Realistic Pod Scaling](studies/2026-10-08-30kb-realistic-pod-scaling.md)
 - [2026-10-09: 5,000-Node Reconnect WatchList Storm (`k/k#138307`)](studies/2026-10-09-node-reconnect-watchlist-storm.md)
+- [2026-10-18: OSS 5,000-Node Config & Metric Parity Audit](studies/2026-10-18-oss-5k-config-and-metric-parity.md)
