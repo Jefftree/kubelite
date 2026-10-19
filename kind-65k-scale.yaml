@@ -1,70 +1,70 @@
-# 1-Node kind Control Plane tuned for 65,000-node scale
+# kind Control Plane tuned for 65,000-node scale
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 networking:
   # 10.64.0.0/10 provides 65,536 /26 node PodCIDRs across all 65,000 simulated nodes
   podSubnet: "10.64.0.0/10"
   serviceSubnet: "10.130.0.0/15"
+kubeadmConfigPatches:
+- |
+  kind: ClusterConfiguration
+  apiServer:
+    extraArgs:
+      max-requests-inflight: "3000"
+      max-mutating-requests-inflight: "0"
+      delete-collection-workers: "32"
+      request-timeout: "300s"
+      etcd-compaction-interval: "315s"
+      event-ttl: "5m"
+      feature-gates: "APIResponseCompression=false"
+      etcd-servers-overrides: "/events#http://127.0.0.1:2383,events.k8s.io/events#http://127.0.0.1:2383,coordination.k8s.io/leases#http://127.0.0.1:2385,/leases.coordination.k8s.io#http://127.0.0.1:2385"
+      watch-cache-sizes: "pods#1500000,nodes#100000,services#20000,endpointslices.discovery.k8s.io#100000,configmaps#50000,leases.coordination.k8s.io#100000,statefulsets.apps#100000,daemonsets.apps#10000,jobsets.jobset.x-k8s.io#100000"
+      token-auth-file: "/etc/kubernetes/pki/tokens/known_tokens.csv"
+      profiling: "true"
+      contention-profiling: "true"
+      anonymous-auth: "true"
+      v: "2"
+  controllerManager:
+    extraArgs:
+      leader-elect: "false"
+      kube-api-qps: "1000"
+      kube-api-burst: "2000"
+      concurrent-daemonset-syncs: "50"
+      concurrent-statefulset-syncs: "50"
+      concurrent-gc-syncs: "100"
+      terminated-pod-gc-threshold: "5000"
+      node-monitor-grace-period: "600s"
+      endpoint-updates-batch-period: "500ms"
+      endpointslice-updates-batch-period: "500ms"
+      profiling: "true"
+      contention-profiling: "true"
+      bind-address: "0.0.0.0"
+      authorization-always-allow-paths: "/healthz,/livez,/readyz,/metrics"
+  scheduler:
+    extraArgs:
+      leader-elect: "false"
+      kube-api-qps: "1000"
+      kube-api-burst: "2000"
+      profiling: "true"
+      contention-profiling: "true"
+      bind-address: "0.0.0.0"
+      authorization-always-allow-paths: "/healthz,/livez,/readyz,/metrics"
+  etcd:
+    local:
+      extraArgs:
+        quota-backend-bytes: "214748364800"
+        snapshot-count: "50000"
+        watch-progress-notify-interval: "5s"
+        enable-pprof: "true"
+        listen-metrics-urls: "http://0.0.0.0:2382"
 nodes:
 - role: control-plane
   extraMounts:
-  - hostPath: /var/lib/kubelite/etcd-main
+  - hostPath: /var/lib/kubelite/etcd-1/main
     containerPath: /var/lib/etcd
-  - hostPath: /var/lib/kubelite/etcd-events
+  - hostPath: /var/lib/kubelite/etcd-1/events
     containerPath: /var/lib/etcd-events
-  - hostPath: /var/lib/kubelite/etcd-leases
+  - hostPath: /var/lib/kubelite/etcd-1/leases
     containerPath: /var/lib/etcd-leases
   - hostPath: /var/lib/kubelite/tokens
     containerPath: /etc/kubernetes/pki/tokens
-  kubeadmConfigPatches:
-  - |
-    kind: ClusterConfiguration
-    apiServer:
-      extraArgs:
-        max-requests-inflight: "3000"
-        max-mutating-requests-inflight: "0"
-        delete-collection-workers: "32"
-        request-timeout: "300s"
-        etcd-compaction-interval: "315s"
-        event-ttl: "5m"
-        feature-gates: "APIResponseCompression=false"
-        etcd-servers-overrides: "/events#http://127.0.0.1:2383,events.k8s.io/events#http://127.0.0.1:2383,coordination.k8s.io/leases#http://127.0.0.1:2385,/leases.coordination.k8s.io#http://127.0.0.1:2385"
-        watch-cache-sizes: "pods#1500000,nodes#100000,services#20000,endpointslices.discovery.k8s.io#100000,configmaps#50000,leases.coordination.k8s.io#100000,statefulsets.apps#100000,daemonsets.apps#10000,jobsets.jobset.x-k8s.io#100000"
-        token-auth-file: "/etc/kubernetes/pki/tokens/known_tokens.csv"
-        profiling: "true"
-        contention-profiling: "true"
-        anonymous-auth: "true"
-        v: "2"
-    controllerManager:
-      extraArgs:
-        leader-elect: "false"
-        kube-api-qps: "1000"
-        kube-api-burst: "2000"
-        concurrent-daemonset-syncs: "50"
-        concurrent-statefulset-syncs: "50"
-        concurrent-gc-syncs: "100"
-        terminated-pod-gc-threshold: "5000"
-        node-monitor-grace-period: "600s"
-        endpoint-updates-batch-period: "500ms"
-        endpointslice-updates-batch-period: "500ms"
-        profiling: "true"
-        contention-profiling: "true"
-        bind-address: "0.0.0.0"
-        authorization-always-allow-paths: "/healthz,/livez,/readyz,/metrics"
-    scheduler:
-      extraArgs:
-        leader-elect: "false"
-        kube-api-qps: "1000"
-        kube-api-burst: "2000"
-        profiling: "true"
-        contention-profiling: "true"
-        bind-address: "0.0.0.0"
-        authorization-always-allow-paths: "/healthz,/livez,/readyz,/metrics"
-    etcd:
-      local:
-        extraArgs:
-          quota-backend-bytes: "214748364800"
-          snapshot-count: "50000"
-          watch-progress-notify-interval: "5s"
-          enable-pprof: "true"
-          listen-metrics-urls: "http://0.0.0.0:2382"

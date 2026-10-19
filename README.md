@@ -41,22 +41,16 @@ flowchart LR
 ## Quickstart
 
 ```bash
-# Install the single self-contained binary (embeds kind configs and hotswap scripts)
+# Install the single self-contained binary (embeds kind configs and cluster setup script)
 CGO_ENABLED=0 go install github.com/Jefftree/kubelite@latest
 
 # Laptop quickstart: attach 100 simulated nodes to any existing ~/.kube/config cluster
 kind create cluster
 kubelite --nodes=100
 
-# 5,000-node scale benchmark: boot tuned 1-node kind control plane + run 5k nodes
+# 5,000-node scale benchmark: boot tuned 1-node (or 3-node --ha) kind control plane + run 5k nodes
 kubelite up --scale=5k
-GOMAXPROCS=48 taskset -c 96-143 kubelite \
-  --kubeconfig=/var/lib/kubelite/kubeconfig \
-  --tokens-file=/var/lib/kubelite/tokens/known_tokens.csv \
-  --nodes=5000
-
-# Optional: hot-swap a custom static kube-apiserver binary in <3 seconds
-kubelite hotswap /path/to/kube-apiserver
+GOMAXPROCS=48 taskset -c 96-143 kubelite --nodes=5000
 
 # Trigger a 5,000-node disconnect / WatchList reconnect storm
 kubelite disconnect

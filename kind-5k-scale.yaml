@@ -1,60 +1,60 @@
-# 1-Node kind Control Plane tuned to match upstream pull-kubernetes-gce-master-scale-performance-5000
+# kind Control Plane tuned to match upstream pull-kubernetes-gce-master-scale-performance-5000
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 networking:
   # 10.64.0.0/10 provides 65,536 /26 node PodCIDRs (default 10.244.0.0/16 exhausts after 256 nodes)
   podSubnet: "10.64.0.0/10"
   serviceSubnet: "10.130.0.0/15"
+kubeadmConfigPatches:
+- |
+  kind: ClusterConfiguration
+  apiServer:
+    extraArgs:
+      max-requests-inflight: "640"
+      max-mutating-requests-inflight: "0"
+      delete-collection-workers: "16"
+      etcd-compaction-interval: "2m30s"
+      etcd-servers-overrides: "/events#http://127.0.0.1:2383"
+      watch-cache-sizes: "pods#100000,nodes#50000,services#16000,endpointslices.discovery.k8s.io#50000,configmaps#50000,leases.coordination.k8s.io#50000,secrets#12800,deployments.apps#12800,replicasets.apps#12800,persistentvolumeclaims#6400"
+      token-auth-file: "/etc/kubernetes/pki/tokens/known_tokens.csv"
+      profiling: "true"
+      contention-profiling: "true"
+      anonymous-auth: "true"
+      v: "3"
+  controllerManager:
+    extraArgs:
+      kube-api-qps: "500"
+      kube-api-burst: "500"
+      endpoint-updates-batch-period: "500ms"
+      endpointslice-updates-batch-period: "500ms"
+      profiling: "true"
+      contention-profiling: "true"
+      bind-address: "0.0.0.0"
+      authorization-always-allow-paths: "/healthz,/livez,/readyz,/metrics"
+  scheduler:
+    extraArgs:
+      kube-api-qps: "500"
+      kube-api-burst: "500"
+      profiling: "true"
+      contention-profiling: "true"
+      bind-address: "0.0.0.0"
+      authorization-always-allow-paths: "/healthz,/livez,/readyz,/metrics"
+  etcd:
+    local:
+      extraArgs:
+        quota-backend-bytes: "21474836480"
+        snapshot-count: "10000"
+        watch-progress-notify-interval: "5s"
+        enable-pprof: "true"
+        listen-metrics-urls: "http://0.0.0.0:2382"
 nodes:
 - role: control-plane
   extraMounts:
-  - hostPath: /var/lib/kubelite/etcd-main
+  - hostPath: /var/lib/kubelite/etcd-1/main
     containerPath: /var/lib/etcd
-  - hostPath: /var/lib/kubelite/etcd-events
+  - hostPath: /var/lib/kubelite/etcd-1/events
     containerPath: /var/lib/etcd-events
-  - hostPath: /var/lib/kubelite/etcd-leases
+  - hostPath: /var/lib/kubelite/etcd-1/leases
     containerPath: /var/lib/etcd-leases
   - hostPath: /var/lib/kubelite/tokens
     containerPath: /etc/kubernetes/pki/tokens
-  kubeadmConfigPatches:
-  - |
-    kind: ClusterConfiguration
-    apiServer:
-      extraArgs:
-        max-requests-inflight: "640"
-        max-mutating-requests-inflight: "0"
-        delete-collection-workers: "16"
-        etcd-compaction-interval: "2m30s"
-        etcd-servers-overrides: "/events#http://127.0.0.1:2383"
-        watch-cache-sizes: "pods#100000,nodes#50000,services#16000,endpointslices.discovery.k8s.io#50000,configmaps#50000,leases.coordination.k8s.io#50000,secrets#12800,deployments.apps#12800,replicasets.apps#12800,persistentvolumeclaims#6400"
-        token-auth-file: "/etc/kubernetes/pki/tokens/known_tokens.csv"
-        profiling: "true"
-        contention-profiling: "true"
-        anonymous-auth: "true"
-        v: "3"
-    controllerManager:
-      extraArgs:
-        kube-api-qps: "500"
-        kube-api-burst: "500"
-        endpoint-updates-batch-period: "500ms"
-        endpointslice-updates-batch-period: "500ms"
-        profiling: "true"
-        contention-profiling: "true"
-        bind-address: "0.0.0.0"
-        authorization-always-allow-paths: "/healthz,/livez,/readyz,/metrics"
-    scheduler:
-      extraArgs:
-        kube-api-qps: "500"
-        kube-api-burst: "500"
-        profiling: "true"
-        contention-profiling: "true"
-        bind-address: "0.0.0.0"
-        authorization-always-allow-paths: "/healthz,/livez,/readyz,/metrics"
-    etcd:
-      local:
-        extraArgs:
-          quota-backend-bytes: "21474836480"
-          snapshot-count: "10000"
-          watch-progress-notify-interval: "5s"
-          enable-pprof: "true"
-          listen-metrics-urls: "http://0.0.0.0:2382"

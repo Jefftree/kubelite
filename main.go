@@ -94,6 +94,8 @@ const (
 	watchListSteadyStateMin = 60 * time.Second
 )
 
+var defaultTokensFileVarLib = "/var/lib/kubelite/tokens/known_tokens.csv"
+
 var defaultNodeImages = func() []corev1.ContainerImage {
 	imgs := make([]corev1.ContainerImage, 25)
 	imgs[0] = corev1.ContainerImage{Names: []string{"registry.k8s.io/pause:3.9", pauseImageID}, SizeBytes: 321520}
@@ -193,8 +195,22 @@ var embeddedKind65kYAML []byte
 //go:embed up-5k-control-plane.sh
 var embeddedUpScript []byte
 
-//go:embed hotswap-apiserver.sh
-var embeddedHotswapScript []byte
+func defaultTokensFilePath() string {
+	if env := os.Getenv("KUBELITE_TOKENS_FILE"); env != "" {
+		return env
+	}
+	if _, err := os.Stat(defaultTokensFileVarLib); err == nil {
+		return defaultTokensFileVarLib
+	}
+	return ""
+}
+
+func resolveTokensFilePath(configured string) string {
+	if configured != "" {
+		return configured
+	}
+	return defaultTokensFilePath()
+}
 
 func fallbackKubeconfigPaths() []string {
 	home, err := os.UserHomeDir()
@@ -1130,7 +1146,7 @@ func (s *Simulator) podActuatorWorker(ctx context.Context) {
 				s.syncPodVolumeWatches(ctx, n, pod, false)
 				if s.cfg.PodStatusStages >= 3 {
 					_ = s.patchPodStatusStage(ctx, n, pod, corev1.PodRunning, -1, nInit, 0, true, "", false, true)
-					if nCont > 1 && len(pod.UID) > 0 && pod.UID[0]%2 == 0 {
+					if nCont > 1 {
 						s.emitPodEvent(ctx, n, pod, "Killing", "Stopping container "+pod.Spec.Containers[0].Name)
 					}
 				}
@@ -1210,9 +1226,8 @@ func (s *Simulator) podActuatorWorker(ctx context.Context) {
 				_ = s.patchPodStatusStage(ctx, n, pod, corev1.PodRunning, -1, nInit, 0, true, "", false, false)
 				if nCont > 1 {
 					s.emitPodEvent(ctx, n, pod, "Started", "Started container "+pod.Spec.Containers[0].Name)
-					for ci := 1; ci < min(3, nCont); ci++ {
+					for ci := 1; ci < nCont; ci++ {
 						s.emitPodEvent(ctx, n, pod, "Created", "Created container "+pod.Spec.Containers[ci].Name)
-						s.emitPodEvent(ctx, n, pod, "Started", "Started container "+pod.Spec.Containers[ci].Name)
 					}
 					if len(pod.UID) > 0 && pod.UID[0]%2 == 0 {
 						_ = s.patchPodStatusStage(ctx, n, pod, corev1.PodRunning, -1, nInit, nCont/2, true, "", false, false)
@@ -1742,6 +1757,7 @@ func (s *Simulator) Run(ctx context.Context) error {
 
 func NewSimulator(cfg Config) (*Simulator, error) {
 	cfg.Kubeconfig = resolveKubeconfigPath(cfg.Kubeconfig)
+	cfg.TokensFile = resolveTokensFilePath(cfg.TokensFile)
 	restCfg, err := clientcmd.BuildConfigFromFlags("", cfg.Kubeconfig)
 	if err != nil {
 		return nil, fmt.Errorf("loading kubeconfig %q: %w", cfg.Kubeconfig, err)
@@ -1874,7 +1890,6 @@ func runEmbeddedScript(scriptName string, scriptBytes []byte, extraEnv []string)
 		"kind-5k-scale.yaml":     embeddedKind5kYAML,
 		"kind-65k-scale.yaml":    embeddedKind65kYAML,
 		"up-5k-control-plane.sh": embeddedUpScript,
-		"hotswap-apiserver.sh":   embeddedHotswapScript,
 	}
 	for name, data := range assets {
 		mode := os.FileMode(0644)
@@ -1893,15 +1908,16 @@ func runEmbeddedScript(scriptName string, scriptBytes []byte, extraEnv []string)
 	return cmd.Run()
 }
 
-func runUpSubcommand(args []string) error {
+func buildUpSubcommandEnv(args []string) ([]string, error) {
 	fs := flag.NewFlagSet("up", flag.ContinueOnError)
 	scale := fs.String("scale", "5k", "Control-plane scale preset: 5k or 65k")
 	clusterName := fs.String("cluster-name", "", "Optional kind cluster name override")
 	numNodes := fs.Int("nodes", 0, "Optional static token count override")
 	dataDir := fs.String("data-dir", "", "Optional host directory for etcd and kubeconfig (default /var/lib/kubelite)")
-	apiserverBin := fs.String("apiserver-bin", "", "Optional custom kube-apiserver binary to hotswap after cluster creation")
+	ha := fs.Bool("ha", false, "Run a 3-node HA kind control plane (sets CONTROL_PLANE_NODES=3)")
+	controlPlaneNodes := fs.Int("control-plane-nodes", 0, "Number of kind control-plane nodes (default 1, or 3 when --ha is set)")
 	if err := fs.Parse(args); err != nil {
-		return err
+		return nil, err
 	}
 	env := []string{"SCALE=" + *scale}
 	if *clusterName != "" {
@@ -1913,35 +1929,25 @@ func runUpSubcommand(args []string) error {
 	if *dataDir != "" {
 		env = append(env, "DATA_DIR="+*dataDir)
 	}
-	if *apiserverBin != "" {
-		env = append(env, "CUSTOM_APISERVER_BIN="+*apiserverBin)
+	if *ha {
+		env = append(env, "HA=true")
 	}
-	return runEmbeddedScript("up-5k-control-plane.sh", embeddedUpScript, env)
+	cpNodes := *controlPlaneNodes
+	if cpNodes <= 0 && *ha {
+		cpNodes = 3
+	}
+	if cpNodes > 0 {
+		env = append(env, fmt.Sprintf("CONTROL_PLANE_NODES=%d", cpNodes))
+	}
+	return env, nil
 }
 
-func runHotswapSubcommand(args []string) error {
-	fs := flag.NewFlagSet("hotswap", flag.ContinueOnError)
-	clusterName := fs.String("cluster-name", "kubelite-5k", "Target kind cluster name")
-	apiserverBin := fs.String("apiserver-bin", "", "Path to static kube-apiserver binary")
-	worktree := fs.String("k8s-worktree", "", "Path to kubernetes source checkout if building kube-apiserver")
-	rebuild := fs.Bool("rebuild", false, "Rebuild kube-apiserver with CGO_ENABLED=0 before swapping")
-	if err := fs.Parse(args); err != nil {
+func runUpSubcommand(args []string) error {
+	env, err := buildUpSubcommandEnv(args)
+	if err != nil {
 		return err
 	}
-	if *apiserverBin == "" && fs.NArg() > 0 {
-		*apiserverBin = fs.Arg(0)
-	}
-	env := []string{"CLUSTER_NAME=" + *clusterName}
-	if *apiserverBin != "" {
-		env = append(env, "APISERVER_BIN="+*apiserverBin)
-	}
-	if *worktree != "" {
-		env = append(env, "K8S_WORKTREE="+*worktree)
-	}
-	if *rebuild {
-		env = append(env, "REBUILD_APISERVER=1")
-	}
-	return runEmbeddedScript("hotswap-apiserver.sh", embeddedHotswapScript, env)
+	return runEmbeddedScript("up-5k-control-plane.sh", embeddedUpScript, env)
 }
 
 func runControlSubcommand(action string, args []string) (string, error) {
@@ -1994,11 +2000,6 @@ func main() {
 				klog.Fatalf("kubelite up failed: %v", err)
 			}
 			return
-		case "hotswap":
-			if err := runHotswapSubcommand(os.Args[2:]); err != nil {
-				klog.Fatalf("kubelite hotswap failed: %v", err)
-			}
-			return
 		case "disconnect", "reconnect", "status":
 			out, err := runControlSubcommand(os.Args[1], os.Args[2:])
 			if err != nil {
@@ -2012,7 +2013,7 @@ func main() {
 	var cfg Config
 	flag.StringVar(&cfg.Kubeconfig, "kubeconfig", defaultKubeconfigPath(), "Path to kubeconfig (defaults to /var/lib/kubelite/kubeconfig with fallback to ~/.kube/kubelite-config and ~/.kube/config)")
 	flag.StringVar(&cfg.APIServerURL, "apiserver-url", "", "Optional apiserver URL override (e.g. https://172.18.0.2:6443)")
-	flag.StringVar(&cfg.TokensFile, "tokens-file", "", "Optional known_tokens.csv path for per-node Bearer token authentication")
+	flag.StringVar(&cfg.TokensFile, "tokens-file", defaultTokensFilePath(), "Optional known_tokens.csv path for per-node Bearer token authentication (defaults to /var/lib/kubelite/tokens/known_tokens.csv when present)")
 	flag.StringVar(&cfg.ControlAddr, "control-addr", "127.0.0.1:18080", "HTTP control address for /disconnect, /reconnect, and /status (empty to disable)")
 	flag.StringVar(&cfg.WatchMode, "watch-mode", "rv0", "Watch initialization mode on boot and reconnect: rv0 (resourceVersion=0, 5k CI default), watchlist (sendInitialEvents=true), or latest")
 	flag.IntVar(&cfg.NumNodes, "nodes", 5000, "Number of simulated nodes")

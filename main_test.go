@@ -406,14 +406,14 @@ func Test5kBenchmarkFidelityInvariants(t *testing.T) {
 	// Wait for both pods to reach PodReady=True (8 + 7 = 15 status patches).
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if patchPodCalls.Load() >= 15 && eventCalls.Load() >= 26 && tokenCalls.Load() >= 2 {
+		if patchPodCalls.Load() >= 15 && eventCalls.Load() >= 24 && tokenCalls.Load() >= 2 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 
 	if got := tokenCalls.Load(); got != 2 {
-		t.Fatalf("expected 2 TokenRequest calls (1.0/pod) on startup, got %d", got)
+		t.Fatalf("expected 2 TokenRequest calls on startup, got %d", got)
 	}
 	if got := patchPodCalls.Load(); got != 15 {
 		t.Fatalf("expected 15 PodStatus PATCH calls on startup (8 even + 7 odd = 7.5/pod), got %d", got)
@@ -421,8 +421,8 @@ func Test5kBenchmarkFidelityInvariants(t *testing.T) {
 	if got := getPodCalls.Load(); got != 17 {
 		t.Fatalf("expected 17 GET Pod calls on startup (9 even + 8 odd = 8.5/pod), got %d", got)
 	}
-	if got := eventCalls.Load(); got != 26 {
-		t.Fatalf("expected 26 Event POST calls on startup (13.0/pod), got %d", got)
+	if got := eventCalls.Load(); got != 24 {
+		t.Fatalf("expected 24 Event POST calls on startup (12.0/pod), got %d", got)
 	}
 
 	// Verify PodStatus payload fidelity (2 InitContainerStatuses, 4 ContainerStatuses, 5 Conditions).
@@ -465,7 +465,7 @@ func Test5kBenchmarkFidelityInvariants(t *testing.T) {
 
 	deadline = time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if deletePodCalls.Load() >= 2 && eventCalls.Load() >= 27 {
+		if deletePodCalls.Load() >= 2 && eventCalls.Load() >= 26 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -474,7 +474,7 @@ func Test5kBenchmarkFidelityInvariants(t *testing.T) {
 	// Full lifecycle invariant checks across the 2 pods (mean per pod in parentheses):
 	// - PATCH pods/status: 15 startup + 4 delete = 19 total (9.5/pod; 9.37 in CL2 where 93.5% of pods delete)
 	// - GET pods:          17 startup + 6 delete = 23 total (11.5 direct GET/pod; 12.05 with watch/list in CL2)
-	// - POST events:       26 startup + 1 delete = 27 total (13.5/pod; 12.88 blended with 1-container pods in CL2)
+	// - POST events:       24 startup + 2 delete = 26 total (13.0 kubelet/pod + 1.88 control-plane/pod = 14.88/pod in CL2)
 	// - POST token:        2 total (1.0/pod)
 	// - DELETE pods:       2 total (1.0/pod)
 	if got := patchPodCalls.Load(); got != 19 {
@@ -483,8 +483,8 @@ func Test5kBenchmarkFidelityInvariants(t *testing.T) {
 	if got := getPodCalls.Load(); got != 23 {
 		t.Fatalf("expected 23 total GET Pod calls (11.5/pod), got %d", got)
 	}
-	if got := eventCalls.Load(); got != 27 {
-		t.Fatalf("expected 27 total Event POST calls (13.5/pod), got %d", got)
+	if got := eventCalls.Load(); got != 26 {
+		t.Fatalf("expected 26 total Event POST calls (13.0 kubelet/pod), got %d", got)
 	}
 	if got := deletePodCalls.Load(); got != 2 {
 		t.Fatalf("expected 2 total DELETE Pod calls (1.0/pod), got %d", got)
@@ -524,8 +524,43 @@ func TestLaptopDefaultsAndEmbeddedSubcommands(t *testing.T) {
 		t.Fatalf("expected resolveKubeconfigPath to fall back to ~/.kube/config (%q), got %q", stdKubeconfig, got)
 	}
 
-	if len(embeddedKind5kYAML) == 0 || len(embeddedKind65kYAML) == 0 || len(embeddedUpScript) == 0 || len(embeddedHotswapScript) == 0 {
+	if len(embeddedKind5kYAML) == 0 || len(embeddedKind65kYAML) == 0 || len(embeddedUpScript) == 0 {
 		t.Fatalf("expected all //go:embed assets to be non-empty")
+	}
+
+	origTokensVarLib := defaultTokensFileVarLib
+	t.Cleanup(func() { defaultTokensFileVarLib = origTokensVarLib })
+	defaultTokensFileVarLib = filepath.Join(tmpHome, "nonexistent", "known_tokens.csv")
+	t.Setenv("KUBELITE_TOKENS_FILE", "")
+	if got := resolveTokensFilePath(""); got != "" {
+		t.Fatalf("expected empty resolveTokensFilePath when no tokens file exists, got %q", got)
+	}
+	autoTokensFile := filepath.Join(tmpHome, "known_tokens.csv")
+	if err := os.WriteFile(autoTokensFile, []byte("token-kubelite-0000,system:node:kubelite-0000,uid-0,\"system:nodes\"\n"), 0644); err != nil {
+		t.Fatalf("WriteFile tokens: %v", err)
+	}
+	defaultTokensFileVarLib = autoTokensFile
+	if got := resolveTokensFilePath(""); got != autoTokensFile {
+		t.Fatalf("expected resolveTokensFilePath to auto-detect %q, got %q", autoTokensFile, got)
+	}
+	if got := resolveTokensFilePath("/explicit/tokens.csv"); got != "/explicit/tokens.csv" {
+		t.Fatalf("expected explicit tokens path override, got %q", got)
+	}
+
+	upEnvHA, err := buildUpSubcommandEnv([]string{"--ha", "--scale=65k"})
+	if err != nil {
+		t.Fatalf("buildUpSubcommandEnv(--ha): %v", err)
+	}
+	upEnvStr := strings.Join(upEnvHA, ",")
+	if !strings.Contains(upEnvStr, "HA=true") || !strings.Contains(upEnvStr, "CONTROL_PLANE_NODES=3") || !strings.Contains(upEnvStr, "SCALE=65k") {
+		t.Fatalf("unexpected buildUpSubcommandEnv(--ha) output: %v", upEnvHA)
+	}
+	upEnvCustom, err := buildUpSubcommandEnv([]string{"--control-plane-nodes=5"})
+	if err != nil {
+		t.Fatalf("buildUpSubcommandEnv(--control-plane-nodes=5): %v", err)
+	}
+	if !strings.Contains(strings.Join(upEnvCustom, ","), "CONTROL_PLANE_NODES=5") {
+		t.Fatalf("expected CONTROL_PLANE_NODES=5 in %v", upEnvCustom)
 	}
 
 	ctrlSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -541,5 +576,90 @@ func TestLaptopDefaultsAndEmbeddedSubcommands(t *testing.T) {
 	}
 	if !strings.Contains(out, `"action":"reconnect"`) || !strings.Contains(out, "watch_mode=watchlist") || !strings.Contains(out, "node_agents=true") {
 		t.Fatalf("unexpected control subcommand output: %s", out)
+	}
+}
+
+func TestUpControlPlaneMultiNodeHARendering(t *testing.T) {
+	tmpDir := t.TempDir()
+	binDir := filepath.Join(tmpDir, "bin")
+	dataDir := filepath.Join(tmpDir, "data")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	for _, sub := range []string{"tokens", "etcd-1/main", "etcd-1/events", "etcd-1/leases", "etcd-2/main", "etcd-2/events", "etcd-2/leases", "etcd-3/main", "etcd-3/events", "etcd-3/leases"} {
+		if err := os.MkdirAll(filepath.Join(dataDir, sub), 0755); err != nil {
+			t.Fatalf("MkdirAll %s: %v", sub, err)
+		}
+	}
+	logFile := filepath.Join(tmpDir, "calls.log")
+
+	mockDocker := `#!/usr/bin/env bash
+echo "docker $*" >> "` + logFile + `"
+if [[ "$1" == "inspect" ]]; then
+  echo "172.18.0.2"
+  exit 0
+fi
+if [[ "$1" == "exec" ]]; then
+  if [[ "$*" == *"grep -m1"* ]]; then
+    echo "registry.k8s.io/etcd:3.5.16-0"
+  fi
+  exit 0
+fi
+exit 0
+`
+	mockKind := `#!/usr/bin/env bash
+echo "kind $*" >> "` + logFile + `"
+if [[ "$1" == "get" && "$2" == "kubeconfig" ]]; then
+  echo "apiVersion: v1"
+  echo "kind: Config"
+fi
+exit 0
+`
+	mockKubectl := `#!/usr/bin/env bash
+echo "kubectl $*" >> "` + logFile + `"
+exit 0
+`
+	for name, content := range map[string]string{"docker": mockDocker, "kind": mockKind, "kubectl": mockKubectl} {
+		if err := os.WriteFile(filepath.Join(binDir, name), []byte(content), 0755); err != nil {
+			t.Fatalf("WriteFile %s: %v", name, err)
+		}
+	}
+
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+	t.Setenv("HOME", tmpDir)
+	if err := runUpSubcommand([]string{"--ha", "--nodes=10", "--data-dir=" + dataDir}); err != nil {
+		t.Fatalf("runUpSubcommand(--ha): %v", err)
+	}
+
+	renderedBytes, err := os.ReadFile(filepath.Join(dataDir, "kind-5k-scale.yaml.rendered"))
+	if err != nil {
+		t.Fatalf("ReadFile rendered kind config: %v", err)
+	}
+	rendered := string(renderedBytes)
+	if got := strings.Count(rendered, "- role: control-plane"); got != 3 {
+		t.Fatalf("expected 3 control-plane nodes in rendered kind config, got %d:\n%s", got, rendered)
+	}
+	for _, wantMount := range []string{
+		dataDir + "/etcd-1/main",
+		dataDir + "/etcd-2/main",
+		dataDir + "/etcd-3/main",
+		dataDir + "/etcd-1/events",
+		dataDir + "/etcd-2/events",
+		dataDir + "/etcd-3/events",
+	} {
+		if !strings.Contains(rendered, wantMount) {
+			t.Fatalf("expected rendered kind config to contain %q:\n%s", wantMount, rendered)
+		}
+	}
+
+	callsBytes, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("ReadFile calls.log: %v", err)
+	}
+	calls := string(callsBytes)
+	for _, wantCP := range []string{"kubelite-5k-control-plane", "kubelite-5k-control-plane2", "kubelite-5k-control-plane3"} {
+		if !strings.Contains(calls, "taint nodes "+wantCP+" node-role.kubernetes.io/control-plane:NoSchedule") {
+			t.Fatalf("expected taint for %s in calls:\n%s", wantCP, calls)
+		}
 	}
 }
